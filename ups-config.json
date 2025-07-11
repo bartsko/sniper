@@ -1,7 +1,0 @@
-{
-  "disable_ipv6": true,
-  "region": "nrt", // Tokyo
-  "plan": "vc2-1c-1gb", // Najtańszy plan
-  "os_id": 387, // Ubuntu 22.04 x64
-  "script_id": "user-data-script"
-}
