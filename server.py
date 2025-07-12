@@ -1,6 +1,3 @@
-### server.py (Unified Backend + Scheduler)
-
-```python
 #!/usr/bin/env python3
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -45,14 +42,12 @@ class ListingIn(BaseModel):
     profit_pct: int = 200
     listing_time: datetime  # ISO format, Z or offset
 
-
 def run_bot(listing: dict):
     # write current listing for bot.py
     with open(CURRENT_FILE, 'w', encoding='utf-8') as f:
         json.dump(listing, f, indent=2)
     # launch bot as separate process
     subprocess.Popen(["python3", str(BOT_SCRIPT)])
-
 
 def start_bot_job(listing_id: str):
     # load full listing record
@@ -64,7 +59,6 @@ def start_bot_job(listing_id: str):
         return
     print(f"[SCHED] Triggering bot for {entry['symbol']} @ {entry['listing_time']}")
     run_bot(entry)
-
 
 def schedule_bot_job(listing_id: str, listing_time: datetime):
     run_at = listing_time.astimezone(pytz.UTC) - timedelta(seconds=10)
@@ -127,5 +121,3 @@ async def delete_listing(listing_id: str):
     if scheduler.get_job(job_id):
         scheduler.remove_job(job_id)
     return {"status": "ok"}
-```
-
