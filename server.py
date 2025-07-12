@@ -43,13 +43,20 @@ def _listener(event):
 scheduler.add_listener(_listener, EVENT_JOB_EXECUTED | EVENT_JOB_ERROR)
 
 # —————————————————————————————————————————————
+# Funkcja pomocnicza dumpująca joby
+def dump_jobs(label: str):
+    print(f"[SCHED] {label}:")
+    for job in scheduler.get_jobs():
+        print(f"  • {job.id} -> next_run_time={job.next_run_time}")
+
+# —————————————————————————————————————————————
 # Start schedulera na starcie FastAPI
 @app.on_event("startup")
 def _start_scheduler():
     if not scheduler.running:
         scheduler.start()
         print("[SCHED] Scheduler started")
-        print("[SCHED] Jobs at startup:", scheduler.get_jobs())
+        dump_jobs("Jobs at startup")
 
 # —————————————————————————————————————————————
 # Model przychodzącego JSON
@@ -77,7 +84,7 @@ def run_bot(listing: dict):
 # —————————————————————————————————————————————
 # Funkcja wywoływana przez APScheduler
 def start_bot_job(listing_id: str):
-    print("[SCHED] Jobs at trigger:", scheduler.get_jobs())
+    dump_jobs("Jobs at trigger")
     if not LISTINGS_FILE.exists():
         return
     all_l = json.loads(LISTINGS_FILE.read_text())
@@ -91,6 +98,9 @@ def start_bot_job(listing_id: str):
 # —————————————————————————————————————————————
 # Dodanie zadania do schedulera
 def schedule_bot_job(listing_id: str, listing_time: datetime):
+    # wymuś timezone UTC jeśli brakuje
+    if listing_time.tzinfo is None:
+        listing_time = listing_time.replace(tzinfo=pytz.UTC)
     run_at = listing_time.astimezone(pytz.UTC) - timedelta(seconds=10)
     now   = datetime.now(pytz.UTC)
     if run_at <= now:
@@ -106,7 +116,7 @@ def schedule_bot_job(listing_id: str, listing_time: datetime):
         replace_existing=True
     )
     print(f"[SCHED] Scheduled {listing_id} at {run_at.isoformat()}")
-    print("[SCHED] Jobs after scheduling:", scheduler.get_jobs())
+    dump_jobs("Jobs after scheduling")
 
 # —————————————————————————————————————————————
 # Endpoints
