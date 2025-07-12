@@ -25,7 +25,7 @@ LISTINGS_FILE = BASE_DIR / "listings.json"
 CURRENT_FILE = BASE_DIR / "current_listing.json"
 BOT_SCRIPT = BASE_DIR / "bot.py"
 
-# APScheduler setup with persistent job store
+# APScheduler with persistent job store
 jobstores = {
     'default': SQLAlchemyJobStore(url='sqlite:///jobs.sqlite')
 }
@@ -40,14 +40,17 @@ class ListingIn(BaseModel):
     quote_amount: float
     price_markup_pct: int
     profit_pct: int = 200
-    listing_time: datetime  # ISO format, Z or offset
+    listing_time: datetime  # ISO with Z or offset
 
 def run_bot(listing: dict):
     # write current listing for bot.py
     with open(CURRENT_FILE, 'w', encoding='utf-8') as f:
         json.dump(listing, f, indent=2)
-    # launch bot as separate process
-    subprocess.Popen(["python3", str(BOT_SCRIPT)])
+    # launch bot as separate process in correct cwd
+    subprocess.Popen(
+        ["python3", str(BOT_SCRIPT)],
+        cwd=str(BASE_DIR)
+    )
 
 def start_bot_job(listing_id: str):
     # load full listing record
