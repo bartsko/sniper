@@ -88,7 +88,7 @@ def start_bot_job(listing_id: str):
     if not LISTINGS_FILE.exists():
         return
     all_l = json.loads(LISTINGS_FILE.read_text())
-    entry = next((l for l in all_l if l["id"] == listing_id), None)
+    entry = next((l for l in all_l if l.get("id") == listing_id), None)
     if not entry:
         print(f"[SCHED] Listing {listing_id} not found")
         return
@@ -148,7 +148,7 @@ async def delete_listing(listing_id: str):
     if not LISTINGS_FILE.exists():
         raise HTTPException(404, "No listings")
     lst = json.loads(LISTINGS_FILE.read_text())
-    filtered = [l for l in lst if l["id"] != listing_id]
+    filtered = [l for l in lst if l.get("id") != listing_id]
     if len(filtered) == len(lst):
         raise HTTPException(404, "Not found")
     with open(LISTINGS_FILE, "w", encoding="utf-8") as f:
