@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 import asyncio, time, hmac, hashlib, json
 from datetime import datetime, timezone
-from urllib.parse import urlencode
 import httpx
 from pathlib import Path
 
-# —————————————————————————————————————————————
-# Wczytanie current_listing.json
 CURRENT_FILE = Path("current_listing.json")
 if not CURRENT_FILE.exists():
     raise FileNotFoundError(f"{CURRENT_FILE} not found")
@@ -25,11 +22,9 @@ PROFIT_PCT       = float(listing.get("profit_pct", 200))
 
 REST_URL = "https://api.mexc.com"
 
-# —————————————————————————————————————————————
 def sign(params: dict, secret: str) -> str:
-    # Wszystko na string, posortowane, url-encode
-    payload = {k: str(v) for k, v in sorted(params.items()) if v is not None}
-    qs = urlencode(payload)
+    # NIE sortuj! Musi być dokładnie taka kolejność jak w params
+    qs = "&".join(f"{k}={params[k]}" for k in params)
     return hmac.new(secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
 
 def log_attempts(attempts):
@@ -40,7 +35,6 @@ def log_attempts(attempts):
     for i,a in enumerate(attempts,1):
         print(f"{i:<3} | {a['sent']:<23} | {a['recv']:<23} | {a['lat']:>7.2f} | {a['status']:<5} | {a['exec_qty']:<8.6f} | {a['msg']}")
 
-# —————————————————————————————————————————————
 async def get_server_offset(client):
     r = await client.get(f"{REST_URL}/api/v3/time")
     return r.json()["serverTime"] - int(time.time()*1000)
@@ -69,18 +63,19 @@ async def prepare_buy(client):
     limit = round(price*(1+PRICE_MARKUP_PCT/100),8)
     print(f"[PREP] market={price} → limit={limit}")
     return {
-        "mode": "limit",
-        "limit_price": limit,
+        "mode":"limit",
+        "limit_price":limit,
         "template_base": {
             "symbol": SYMBOL,
             "side": "BUY",
             "type": "LIMIT",
             "price": str(limit),
+            "quantity": None, # wypełnione później
             "timeInForce": "IOC",
             "recvWindow": "5000"
         },
         "url": f"{REST_URL}/api/v3/order",
-        "headers": {"X-MEXC-APIKEY": API_KEY}
+        "headers": {"X-MEXC-APIKEY":API_KEY}
     }
 
 def busy_wait(ms:int):
@@ -89,28 +84,24 @@ def busy_wait(ms:int):
 
 async def place_buy(client,build,offset,send_at,qty):
     busy_wait(send_at)
-    p = build["template_base"].copy()
-    p["quantity"] = str(qty)
-    p["timestamp"] = str(int(time.time()*1000)+offset)
-    p["signature"] = sign(p, API_SECRET)
-    sent = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    start = time.perf_counter()
-    resp = await client.post(build["url"],params=p,headers=build["headers"])
-    lat = (time.perf_counter()-start)*1000
-    d = resp.json(); status = "OK" if "orderId" in d else "ERR"
-    return {
-        "sent": sent,
-        "recv": datetime.now().strftime("%H:%M:%S.%f")[:-3],
-        "lat": lat,
-        "status": status,
-        "exec_qty": float(d.get("executedQty","0")),
-        "msg": d.get("msg","")
-    }
+    p=build["template_base"].copy()
+    p["quantity"]=str(qty)
+    p["timestamp"]=str(int(time.time()*1000)+offset)
+    # Musi być dokładna kolejność: symbol, side, type, price, quantity, timeInForce, recvWindow, timestamp
+    p = {k: p[k] for k in ["symbol","side","type","price","quantity","timeInForce","recvWindow","timestamp"]}
+    p["signature"]=sign(p,API_SECRET)
+    sent=datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    start=time.perf_counter()
+    resp=await client.post(build["url"],params=p,headers=build["headers"])
+    lat=(time.perf_counter()-start)*1000
+    d=resp.json(); status="OK" if "orderId" in d else "ERR"
+    return {"sent":sent,"recv":datetime.now().strftime("%H:%M:%S.%f")[:-3],"lat":lat,"status":status,"exec_qty":float(d.get("executedQty","0")),"msg":d.get("msg","")}
 
 async def place_market(client,offset,send_at,amount):
     busy_wait(send_at)
-    ts = str(int(time.time()*1000)+offset)
-    p = {
+    ts=str(int(time.time()*1000)+offset)
+    # parametry i kolejność kluczy!
+    params = {
         "symbol": SYMBOL,
         "side": "BUY",
         "type": "MARKET",
@@ -118,77 +109,56 @@ async def place_market(client,offset,send_at,amount):
         "recvWindow": "5000",
         "timestamp": ts
     }
-    p["signature"] = sign(p, API_SECRET)
-    sent = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    start = time.perf_counter()
-    resp = await client.post(f"{REST_URL}/api/v3/order", params=p, headers={"X-MEXC-APIKEY":API_KEY})
-    lat = (time.perf_counter()-start)*1000
-    d = resp.json(); status = "OK" if "orderId" in d else "ERR"
-    return {
-        "sent": sent,
-        "recv": datetime.now().strftime("%H:%M:%S.%f")[:-3],
-        "lat": lat,
-        "status": status,
-        "exec_qty": float(d.get("executedQty","0")),
-        "msg": d.get("msg","")
-    }
+    params["signature"] = sign(params, API_SECRET)
+    sent=datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    start=time.perf_counter()
+    resp=await client.post(f"{REST_URL}/api/v3/order", params=params, headers={"X-MEXC-APIKEY":API_KEY})
+    lat=(time.perf_counter()-start)*1000
+    d=resp.json(); status="OK" if "orderId" in d else "ERR"
+    return {"sent":sent,"recv":datetime.now().strftime("%H:%M:%S.%f")[:-3],"lat":lat,"status":status,"exec_qty":float(d.get("executedQty","0")),"msg":d.get("msg","")}
 
-# —————————————————————————————————————————————
 async def main():
     print(f"[INFO] {SYMBOL} @ {LISTING_TIME}, amount={QUOTE_AMOUNT}, markup={PRICE_MARKUP_PCT}%, profit={PROFIT_PCT}%")
     async with httpx.AsyncClient(http2=True) as client:
-        offset = await get_server_offset(client)
-        print(f"[SYNC] offset: {offset}ms")
-        t0 = int(datetime.fromisoformat(LISTING_TIME).astimezone(timezone.utc).timestamp()*1000)
-        now = lambda: int(time.time()*1000)
-        while now() < t0-10000:
-            await asyncio.sleep(0.001)
-        build = await prepare_buy(client)
-        await warmup(client)
+        offset=await get_server_offset(client); print(f"[SYNC] offset: {offset}ms")
+        t0=int(datetime.fromisoformat(LISTING_TIME).astimezone(timezone.utc).timestamp()*1000)
+        now=lambda:int(time.time()*1000)
+        while now()<t0-10000: await asyncio.sleep(0.001)
+        build=await prepare_buy(client); await warmup(client)
         t0_local = t0
-        atts = []; rem = QUOTE_AMOUNT
-        for sa in (t0_local-10, t0_local-5, t0_local):
-            if rem <= 0: break
+        atts=[]; rem=QUOTE_AMOUNT
+        for sa in (t0_local-10,t0_local-5,t0_local):
+            if rem<=0: break
             if build["mode"]=="limit":
-                q = round(rem/build["limit_price"],6)
-                att = await place_buy(client,build,offset,sa,q)
+                q=round(rem/build["limit_price"],6); att=await place_buy(client,build,offset,sa,q)
             else:
-                att = await place_market(client,offset,sa,rem)
+                att=await place_market(client,offset,sa,rem)
             atts.append(att)
             if att["status"]=="OK":
-                rem -= att["exec_qty"]*(build.get("limit_price") or 1)
+                rem-=att["exec_qty"]*(build.get("limit_price") or 1)
         log_attempts(atts)
-        bought = QUOTE_AMOUNT-rem
-        if bought <= 0:
-            print("[BOT] no buy")
-            return
-        sell_price = round((build.get("limit_price") or 0)*(1+PROFIT_PCT/100),8)
-        sell_qty = bought/(build.get("limit_price") or 1)
+        bought=QUOTE_AMOUNT-rem
+        if bought<=0: print("[BOT] no buy"); return
+        sell_price=round((build.get("limit_price") or 0)*(1+PROFIT_PCT/100),8)
+        sell_qty=bought/(build.get("limit_price") or 1)
         print(f"[BOT] SELL {sell_qty}@{sell_price}")
-        sp = {
+        sp={
             "symbol": SYMBOL,
             "side": "SELL",
             "type": "LIMIT",
             "price": str(sell_price),
             "quantity": str(round(sell_qty,6)),
-            "timeInForce": "GTC",
-            "recvWindow": "5000",
-            "timestamp": str(int(time.time()*1000)+offset)
+            "timeInForce":"GTC",
+            "recvWindow":"5000",
+            "timestamp":str(int(time.time()*1000)+offset)
         }
-        sp["signature"] = sign(sp, API_SECRET)
-        sent = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-        start = time.perf_counter()
-        resp = await client.post(f"{REST_URL}/api/v3/order",params=sp,headers={"X-MEXC-APIKEY":API_KEY})
-        lat = (time.perf_counter()-start)*1000
-        d = resp.json(); status = "OK" if "orderId" in d else "ERR"
-        log_attempts([{
-            "sent": sent,
-            "recv": datetime.now().strftime("%H:%M:%S.%f")[:-3],
-            "lat": lat,
-            "status": status,
-            "exec_qty": sell_qty,
-            "msg": d.get("msg","")
-        }])
+        # Kolejność parametrów!
+        sp = {k: sp[k] for k in ["symbol","side","type","price","quantity","timeInForce","recvWindow","timestamp"]}
+        sp["signature"]=sign(sp,API_SECRET)
+        sent=datetime.now().strftime("%H:%M:%S.%f")[:-3]; start=time.perf_counter()
+        resp=await client.post(f"{REST_URL}/api/v3/order",params=sp,headers={"X-MEXC-APIKEY":API_KEY})
+        lat=(time.perf_counter()-start)*1000; d=resp.json(); status="OK" if "orderId" in d else "ERR"
+        log_attempts([{"sent":sent,"recv":datetime.now().strftime("%H:%M:%S.%f")[:-3],"lat":lat,"status":status,"exec_qty":sell_qty,"msg":d.get("msg","")}])
 
 if __name__=="__main__":
     asyncio.run(main())
