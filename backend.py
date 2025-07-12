@@ -1,11 +1,11 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import json
 from pathlib import Path
 
 app = FastAPI()
 
-# POZWÓL na połączenia z iOS
+# CORS dla połączeń z iOS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -14,6 +14,11 @@ app.add_middleware(
 )
 
 LISTINGS_PATH = Path("listings.json")
+
+@app.post("/login")
+async def login(data: dict):
+    # tutaj można dokładać walidację hasła, SSH itp.
+    return {"status": "ok"}
 
 @app.post("/add_listing")
 async def add_listing(listing: dict):
@@ -27,12 +32,11 @@ async def add_listing(listing: dict):
     return {"status": "ok"}
 
 @app.get("/listings")
-def get_listings():
+async def get_listings():
     if LISTINGS_PATH.exists():
-        with open(LISTINGS_PATH) as f:
-            return json.load(f)
+        return json.load(open(LISTINGS_PATH, "r"))
     return []
 
 @app.get("/status")
-def status():
+async def status():
     return {"ok": True}
