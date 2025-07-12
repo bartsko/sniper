@@ -13,12 +13,14 @@ from pathlib import Path
 
 # —————————————————————————————————————————————
 # 1) Wczytanie danych listingu z JSON
-LISTING_FILE = Path("listings.json")
-if not LISTING_FILE.exists():
-    raise FileNotFoundError(f"{LISTING_FILE} not found")
+CURRENT_FILE = Path("current_listing.json")
+if not CURRENT_FILE.exists():
+    raise FileNotFoundError(f"{CURRENT_FILE} not found")
 
-with open(LISTING_FILE, "r") as f:
+with open(CURRENT_FILE, "r", encoding="utf-8") as f:
     listing = json.load(f)
+
+print(f"[BOT] Loaded listing: {listing}")
 
 API_KEY          = listing["api_key"]
 API_SECRET       = listing["api_secret"]
@@ -32,13 +34,11 @@ REST_URL = "https://api.mexc.com"
 WS_URL   = "wss://wbs.mexc.com/ws"
 
 # —————————————————————————————————————————————
-# HMAC SHA256 podpis
 def sign(params: dict, secret: str) -> str:
     qs = "&".join(f"{k}={params[k]}" for k in sorted(params))
     return hmac.new(secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
 
 # —————————————————————————————————————————————
-# Logowanie prób zleceń
 def log_attempts(attempts):
     print("\n📊 Tabela prób:\n")
     header = f"{'Nr':<3} | {'Wysłano':<23} | {'Odpowiedź':<23} | {'Lat(ms)':<8} | {'Status':<5} | {'Qty':<8} | {'Msg'}"
@@ -48,14 +48,12 @@ def log_attempts(attempts):
         print(f"{i:<3} | {a['sent']:<23} | {a['recv']:<23} | {a['lat']:>7.2f} | {a['status']:<5} | {a['exec_qty']:<8.6f} | {a['msg']}")
 
 # —————————————————————————————————————————————
-# Pobranie offsetu czasu serwera
 async def get_server_offset(client):
     r = await client.get(f"{REST_URL}/api/v3/time")
     server_ms = r.json()["serverTime"]
     return server_ms - int(time.time() * 1000)
 
 # —————————————————————————————————————————————
-# Warmup TCP/TLS
 async def warmup(client):
     await client.get(f"{REST_URL}/api/v3/time")
     ts = int(time.time() * 1000) - 100_000
@@ -72,7 +70,6 @@ async def warmup(client):
                       headers={"X-MEXC-APIKEY": API_KEY})
 
 # —————————————————————————————————————————————
-# Przygotowanie BUY LIMIT IOC lub fallback do MARKET
 async def prepare_buy(client):
     r = await client.get(f"{REST_URL}/api/v3/depth", params={"symbol": SYMBOL, "limit": 5})
     asks = r.json().get("asks", [])
@@ -99,20 +96,17 @@ async def prepare_buy(client):
     }
 
 # —————————————————————————————————————————————
-# Busy‐wait do precyzyjnego momentu
 def busy_wait(target_ms: int):
     target_ns = target_ms * 1_000_000
     while time.time_ns() < target_ns:
         pass
 
 # —————————————————————————————————————————————
-# Wysłanie BUY LIMIT IOC
 async def place_buy(client, build, offset, send_at, quantity):
     busy_wait(send_at)
     params = build["template_base"].copy()
     params["quantity"] = str(quantity)
-    ts = int(time.time() * 1000) + offset
-    params["timestamp"] = ts
+    params["timestamp"] = int(time.time() * 1000) + offset
     params["signature"] = sign(params, API_SECRET)
 
     sent = datetime.now().strftime("%H:%M:%S.%f")[:-3]
@@ -123,24 +117,17 @@ async def place_buy(client, build, offset, send_at, quantity):
     status = "OK" if "orderId" in data else "ERR"
     msg = data.get("msg", "")
     exec_qty = float(data.get("executedQty", "0"))
-    return {
-        "sent": sent,
-        "recv": datetime.now().strftime("%H:%M:%S.%f")[:-3],
-        "lat": lat,
-        "status": status,
-        "msg": msg,
-        "exec_qty": exec_qty
-    }
+    return {"sent": sent, "recv": datetime.now().strftime("%H:%M:%S.%f")[:-3],
+            "lat": lat, "status": status, "msg": msg, "exec_qty": exec_qty}
 
 # —————————————————————————————————————————————
-# Wysłanie MARKET BUY
 async def place_market(client, offset, send_at, quote_amount):
     busy_wait(send_at)
     ts = int(time.time() * 1000) + offset
     qs = (f"symbol={SYMBOL}&side=BUY&type=MARKET"
           f"&quoteOrderQty={quote_amount}&recvWindow=5000"
           f"&timestamp={ts}")
-    sig = hmac.new(API_SECRET.encode(), qs.encode(), hashlib.sha256).hexdigest()
+    sig = hashlib.sha256(f"{qs}".encode()).hexdigest()
     url = f"{REST_URL}/api/v3/order?{qs}&signature={sig}"
 
     sent = datetime.now().strftime("%H:%M:%S.%f")[:-3]
@@ -151,43 +138,31 @@ async def place_market(client, offset, send_at, quote_amount):
     status = "OK" if "orderId" in data else "ERR"
     msg = data.get("msg", "")
     exec_qty = float(data.get("executedQty", "0"))
-    return {
-        "sent": sent,
-        "recv": datetime.now().strftime("%H:%M:%S.%f")[:-3],
-        "lat": lat,
-        "status": status,
-        "msg": msg,
-        "exec_qty": exec_qty
-    }
+    return {"sent": sent, "recv": datetime.now().strftime("%H:%M:%S.%f")[:-3],
+            "lat": lat, "status": status, "msg": msg, "exec_qty": exec_qty}
 
 # —————————————————————————————————————————————
-# Główna funkcja
 async def main():
     print(f"[INFO] {SYMBOL} @ {LISTING_TIME}, amount={QUOTE_AMOUNT}, markup={PRICE_MARKUP_PCT}%, profit={PROFIT_PCT}%")
     async with httpx.AsyncClient(http2=True) as client:
-        # 1) Synchronizacja czasu
         offset = await get_server_offset(client)
         print(f"[SYNC] offset: {offset} ms")
 
-        # 2) Oblicz T0 UTC
         dt = datetime.fromisoformat(LISTING_TIME)
         t0_utc = int(dt.astimezone(timezone.utc).timestamp() * 1000)
 
-        # 3) Czekaj do T0−10000 ms (10 s przed)
         now_ms = lambda: int(time.time() * 1000)
         while now_ms() < t0_utc - 10000:
             await asyncio.sleep(0.001)
 
-        # 4) Przygotowanie i rozgrzewka
         build = await prepare_buy(client)
         await warmup(client)
 
-        # 5) WebSocket tylko w trybie limit
         if build.get("mode") == "limit":
             print("[WS] subskrybuję trade…")
             async with websockets.connect(WS_URL) as ws:
-                await ws.send(json.dumps({"method":"SUBSCRIBE",
-                                           "params":[f"{SYMBOL.lower()}@trade"], "id":1}))
+                await ws.send(json.dumps({"method": "SUBSCRIBE",
+                                           "params": [f"{SYMBOL.lower()}@trade"], "id": 1}))
                 while True:
                     msg = await ws.recv()
                     data = json.loads(msg)
@@ -196,10 +171,8 @@ async def main():
                         print(f"[WS] T0 @ {t0_local}")
                         break
         else:
-            # tryb MARKET: nie czekamy na WS
             t0_local = t0_utc
 
-        # 6) Sekwencyjne próby BUY z zatrzymaniem po pełnym zakupie
         attempts = []
         remaining = QUOTE_AMOUNT
         for send_at in (t0_local - 10, t0_local - 5, t0_local):
@@ -216,14 +189,13 @@ async def main():
                 remaining -= used
         log_attempts(attempts)
 
-        # 7) SELL jeśli cokolwiek kupiono
         bought = QUOTE_AMOUNT - remaining
         if bought <= 0:
             print("[BOT] Nie kupiono nic, kończę")
             return
 
-        sell_price = round((build.get("limit_price") or 0) * (1 + PROFIT_PCT/100), 8)
-        sell_qty   = bought / (build.get("limit_price") or 1)
+        sell_price = round((build.get("limit_price") or 0) * (1 + PROFIT_PCT / 100), 8)
+        sell_qty = bought / (build.get("limit_price") or 1)
         print(f"[BOT] Sprzedaję {sell_qty:.6f}@{sell_price}")
 
         sell_params = {
@@ -245,9 +217,9 @@ async def main():
         lat = (time.perf_counter() - start) * 1000
         data = resp.json()
         status = "OK" if "orderId" in data else "ERR"
-        msg    = data.get("msg", "")
-        log_attempts([{"sent":sent, "recv":datetime.now().strftime("%H:%M:%S.%f")[:-3],
-                       "lat":lat, "status":status, "exec_qty": sell_qty, "msg":msg}])
+        msg = data.get("msg", "")
+        log_attempts([{"sent": sent, "recv": datetime.now().strftime("%H:%M:%S.%f")[:-3],
+                       "lat": lat, "status": status, "exec_qty": sell_qty, "msg": msg}])
 
 if __name__ == "__main__":
     asyncio.run(main())
