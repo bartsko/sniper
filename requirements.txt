@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+apscheduler
+sqlalchemy
+pytz
+python-dotenv   
