@@ -23,6 +23,7 @@ PROFIT_PCT       = float(listing.get("profit_pct", 200))
 REST_URL = "https://api.mexc.com"
 
 def sign(params: dict, secret: str) -> str:
+    # NIE sortuj! Musi być dokładnie taka kolejność jak w params
     qs = "&".join(f"{k}={params[k]}" for k in params)
     return hmac.new(secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
 
@@ -76,26 +77,36 @@ async def prepare_buy(client):
     }
 
 def busy_wait_until(target_ms:int):
+    # Czeka aktywnie do target_ms (epoch ms)
     while int(time.time()*1000) < target_ms:
         time.sleep(0.0005)
 
-async def place_buy(client,build,offset,send_at,qty):
+async def place_buy(client, build, offset, send_at, qty, success_event):
     busy_wait_until(send_at)
-    p=build["template_base"].copy()
-    p["quantity"]=str(qty)
-    p["timestamp"]=str(int(time.time()*1000)+offset)
+    if success_event.is_set():
+        # Ktoś już kupił, kończ task
+        return None
+    p = build["template_base"].copy()
+    p["quantity"] = str(qty)
+    p["timestamp"] = str(int(time.time()*1000)+offset)
+    # Musi być dokładna kolejność
     p = {k: p[k] for k in ["symbol","side","type","price","quantity","timeInForce","recvWindow","timestamp"]}
-    p["signature"]=sign(p,API_SECRET)
-    sent=datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    start=time.perf_counter()
-    resp=await client.post(build["url"],params=p,headers=build["headers"])
-    lat=(time.perf_counter()-start)*1000
-    d=resp.json(); status="OK" if "orderId" in d else "ERR"
-    return {"sent":sent,"recv":datetime.now().strftime("%H:%M:%S.%f")[:-3],"lat":lat,"status":status,"exec_qty":float(d.get("executedQty","0")),"msg":d.get("msg","")}
+    p["signature"] = sign(p, API_SECRET)
+    sent = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    start = time.perf_counter()
+    resp = await client.post(build["url"], params=p, headers=build["headers"])
+    lat = (time.perf_counter()-start)*1000
+    d = resp.json(); status = "OK" if "orderId" in d else "ERR"
+    result = {"sent":sent,"recv":datetime.now().strftime("%H:%M:%S.%f")[:-3],"lat":lat,"status":status,"exec_qty":float(d.get("executedQty","0")),"msg":d.get("msg","")}
+    if status == "OK" and result["exec_qty"] > 0:
+        success_event.set()
+    return result
 
-async def place_market(client,offset,send_at,amount):
+async def place_market(client, offset, send_at, amount, success_event):
     busy_wait_until(send_at)
-    ts=str(int(time.time()*1000)+offset)
+    if success_event.is_set():
+        return None
+    ts = str(int(time.time()*1000)+offset)
     params = {
         "symbol": SYMBOL,
         "side": "BUY",
@@ -105,12 +116,15 @@ async def place_market(client,offset,send_at,amount):
         "timestamp": ts
     }
     params["signature"] = sign(params, API_SECRET)
-    sent=datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    start=time.perf_counter()
-    resp=await client.post(f"{REST_URL}/api/v3/order", params=params, headers={"X-MEXC-APIKEY":API_KEY})
-    lat=(time.perf_counter()-start)*1000
-    d=resp.json(); status="OK" if "orderId" in d else "ERR"
-    return {"sent":sent,"recv":datetime.now().strftime("%H:%M:%S.%f")[:-3],"lat":lat,"status":status,"exec_qty":float(d.get("executedQty","0")),"msg":d.get("msg","")}
+    sent = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    start = time.perf_counter()
+    resp = await client.post(f"{REST_URL}/api/v3/order", params=params, headers={"X-MEXC-APIKEY":API_KEY})
+    lat = (time.perf_counter()-start)*1000
+    d = resp.json(); status = "OK" if "orderId" in d else "ERR"
+    result = {"sent":sent,"recv":datetime.now().strftime("%H:%M:%S.%f")[:-3],"lat":lat,"status":status,"exec_qty":float(d.get("executedQty","0")),"msg":d.get("msg","")}
+    if status == "OK" and result["exec_qty"] > 0:
+        success_event.set()
+    return result
 
 async def main():
     print(f"[INFO] {SYMBOL} @ {LISTING_TIME}, amount={QUOTE_AMOUNT}, markup={PRICE_MARKUP_PCT}%, profit={PROFIT_PCT}%")
@@ -120,56 +134,52 @@ async def main():
 
         t0=int(datetime.fromisoformat(LISTING_TIME).astimezone(timezone.utc).timestamp()*1000)
         now=lambda:int(time.time()*1000)
-        
         # Czekaj do -4 sekundy przed listingiem
         while now()<t0-4000: await asyncio.sleep(0.01)
-        
-        # Odśwież offset tuż przed zakupami!
         offset=await get_server_offset(client)
         print(f"[SYNC] offset (przed zakupem): {offset}ms")
 
-        # 5 sekund przed listingiem — sprawdź orderbook
         while now()<t0-5000: await asyncio.sleep(0.01)
-        build=await prepare_buy(client)
+        build = await prepare_buy(client)
         await warmup(client)
         t0_local = t0
-        atts=[]; rem=QUOTE_AMOUNT
         buy_times = [t0_local-10, t0_local-5, t0_local]
+        success_event = asyncio.Event()
+        atts = []
+        rem = QUOTE_AMOUNT
         bought = 0
 
         if build is not None:
-            # LIMIT zlecenia
-            for sa in buy_times:
-                if rem <= 0:
-                    break
-                q=round(rem/build["limit_price"],6)
-                att=await place_buy(client,build,offset,sa,q)
-                atts.append(att)
-                if att["status"]=="OK" and att["exec_qty"]>0:
-                    rem -= att["exec_qty"]*build["limit_price"]
-                    bought += att["exec_qty"]*build["limit_price"]
-                    print("[BOT] Udało się kupić LIMIT — przerywam kolejne próby.")
-                    break
+            # LIMIT – 3 taski naraz!
+            qty = round(rem / build["limit_price"], 6)
+            tasks = [
+                place_buy(client, build, offset, buy_times[i], qty, success_event)
+                for i in range(3)
+            ]
         else:
-            # MARKET zlecenia
             print("[BOT] Próba market (orderbook pusty/lub fail limitów)...")
-            for sa in buy_times:
-                if rem <= 0:
-                    break
-                att=await place_market(client,offset,sa,rem)
-                atts.append(att)
-                if att["status"]=="OK" and att["exec_qty"]>0:
-                    rem -= att["exec_qty"]
-                    bought += att["exec_qty"]
-                    print("[BOT] Udało się kupić MARKET — przerywam kolejne próby.")
-                    break
+            tasks = [
+                place_market(client, offset, buy_times[i], rem, success_event)
+                for i in range(3)
+            ]
 
-        log_attempts(atts)
+        results = await asyncio.gather(*tasks)
+        results = [r for r in results if r is not None]
+        log_attempts(results)
+
+        for r in results:
+            if r["status"]=="OK" and r["exec_qty"]>0:
+                if build is not None:
+                    bought = r["exec_qty"]*build["limit_price"]
+                else:
+                    bought = r["exec_qty"]
+                break
+
         if bought<=0:
             print("[BOT] no buy")
             return
 
-        # SELL jak dotąd
+        # SELL
         if build is not None:
             sell_price=round((build["limit_price"])*(1+PROFIT_PCT/100),8)
             sell_qty=bought/(build["limit_price"])
