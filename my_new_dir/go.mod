@@ -1,4 +1,4 @@
-module github.com/bartsko/sniper/bot
+module github.com/bartsko/sniper/bot-go
 
 go 1.21
 
