@@ -102,7 +102,7 @@ func httpPost(client *http.Client, url string, headers, qs map[string]string) []
 	return body
 }
 
-// busy-wait until epoch-ms reaches target
+// busy-wait aż epoch-ms osiągnie target
 func busyWait(targetMs int64) {
 	for time.Now().UnixNano()/1e6 < targetMs {
 	}
@@ -125,7 +125,6 @@ func main() {
 	t0ms := t0.UTC().UnixNano() / 1e6
 
 	// 2) Na ~5s przed T0: synchronizacja czasu + warmup
-	//   warmup na timestamp (teraz -100s)
 	offsetData := httpGet(client, REST_URL+"/api/v3/time", nil, nil)
 	var srv struct{ ServerTime int64 `json:"serverTime"` }
 	must(json.Unmarshal(offsetData, &srv))
@@ -145,10 +144,10 @@ func main() {
 	httpPost(client, REST_URL+"/api/v3/order", map[string]string{"X-MEXC-APIKEY": l.APIKey}, warmupParams)
 	log.Println("[WARMUP] done")
 
-	// czekaj aż do ~4s przed
+	// 3) Czekaj aż do ~4s przed T0
 	busyWait(t0ms - 4000 - offset)
 
-	// 3) Pobierz ASK z orderbook, oblicz limit-price lub tryb MARKET
+	// 4) Pobierz orderbook i oblicz tryb LIMIT/MARKET
 	depthData := httpGet(client, REST_URL+"/api/v3/depth", nil,
 		map[string]string{"symbol": l.Symbol, "limit": "5"})
 	var depth struct{ Asks [][]string `json:"asks"` }
@@ -170,20 +169,18 @@ func main() {
 		qty = math.Round(l.QuoteAmount/limitPrice*1e6) / 1e6
 	}
 
-	// 4) Przygotuj próby: T0-10ms, -5ms, 0ms
+	// 5) Przygotuj offsety i kanał zadań
 	buyOffsets := []int64{-10, -5, 0}
 	var success atomic.Bool
 	var results []attemptResult
-
-	// 5) Wyślij trzy próby równolegle, ale bez blokowania kolejki
-	type job struct{ off int64; idx int }
+	type job struct{ off int64 }
 	jobs := make(chan job, len(buyOffsets))
-	for i, off := range buyOffsets {
-		jobs <- job{off, i}
+	for _, off := range buyOffsets {
+		jobs <- job{off}
 	}
 	close(jobs)
 
-	// start workerów
+	// 6) Uruchom workerów równolegle
 	done := make(chan struct{})
 	for w := 0; w < len(buyOffsets); w++ {
 		go func() {
@@ -240,20 +237,20 @@ func main() {
 					Msg:     msg,
 				})
 
-				log.Printf("[TRY] sent=%s recv=%s lat=%.2fms stat=%s qty=%.6f msg=%s",
-					sent.Format("15:04:05.000"), recv.Format("15:04:05.000"),
+				log.Printf("[TRY] off=%+dms sent=%s recv=%s lat=%.2fms stat=%s qty=%.6f msg=%s",
+					jb.off, sent.Format("15:04:05.000"), recv.Format("15:04:05.000"),
 					lat, stat, execQty, msg)
 			}
 			done <- struct{}{}
 		}()
 	}
 
-	// czekaj aż wszyscy pracownicy skończą
+	// poczekaj na zakończenie wszystkich workerów
 	for i := 0; i < len(buyOffsets); i++ {
 		<-done
 	}
 
-	// 6) Logowanie tabelą
+	// 7) Wyświetl tabelę prób
 	fmt.Println("\n📊 Tabela prób:")
 	fmt.Printf("%-3s | %-12s | %-12s | %-8s | %-6s | %-9s | %-11s | %s\n",
 		"Nr", "Wysłano", "Odebrano", "Lat(ms)", "Status", "Qty", "Price", "Msg")
@@ -263,12 +260,12 @@ func main() {
 			i+1, a.Sent, a.Recv, a.Latency, a.Status, a.Qty, a.Price, a.Msg)
 	}
 
-	// 7) Jeżeli żaden nie był OK → stagnacja?
+	// 8) Jeżeli żaden LIMIT nie zwrócił OK → sprawdzamy stagnację 3s
 	if !success.Load() && mode == "LIMIT" {
 		log.Println("[BOT] wszystkie LIMIT próby NOFILL → sprawdzam stagnację 3s")
 		first := ""
 		stag := true
-		for i := 0; i < 6; i++ {
+		for i := 0; i < 6; i++ { // 6×500 ms = 3 s
 			time.Sleep(500 * time.Millisecond)
 			d := httpGet(client, REST_URL+"/api/v3/depth", nil,
 				map[string]string{"symbol": l.Symbol, "limit": "5"})
@@ -284,22 +281,21 @@ func main() {
 			}
 		}
 		if stag {
-			log.Println("[BOT] STAGNACJA → zaplanuj ponowny BUY za 10min")
+			log.Println("[BOT] STAGNACJA → zaplanuj ponowny BUY za 10 min")
+			// tutaj schedulerem możesz zapisać zadanie na T0+10min−5s
 		} else {
 			log.Println("[BOT] cena ruszyła → kończę no buy")
 		}
-		if stag {
-			// tutaj możesz rzucić schedulerem na t0+10m-5s
-		}
 		return
 	}
 
+	// 9) Jeśli wciąż no buy (MARKET fallback) → koniec
 	if !success.Load() {
-		log.Println("[BOT] no buy (MARKET fallback też się nie udał)")
+		log.Println("[BOT] no buy (MARKET też nie wypalił)")
 		return
 	}
 
-	// 8) SELL TP natychmiast po pierwszym OK
+	// 10) SELL TP natychmiast po pierwszym OK
 	sellPrice := math.Round(limitPrice*(1+l.ProfitPct/100)*1e8) / 1e8
 	sellQty := math.Round(qty*1e6) / 1e6
 	params := map[string]string{
