@@ -1,3 +1,5 @@
+package main
+
 import (
 	"bytes"
 	"crypto/hmac"
@@ -19,13 +21,13 @@ const REST_URL = "https://api.mexc.com"
 
 // Listing opisany w current_listing.json
 type Listing struct {
-	APIKey         string  json:"api_key"
-	APISecret      string  json:"api_secret"
-	Symbol         string  json:"symbol"
-	QuoteAmount    float64 json:"quote_amount"
-	ListingTime    string  json:"listing_time"
-	PriceMarkupPct float64 json:"price_markup_pct"
-	ProfitPct      float64 json:"profit_pct"
+	APIKey         string  `json:"api_key"`
+	APISecret      string  `json:"api_secret"`
+	Symbol         string  `json:"symbol"`
+	QuoteAmount    float64 `json:"quote_amount"`
+	ListingTime    string  `json:"listing_time"`
+	PriceMarkupPct float64 `json:"price_markup_pct"`
+	ProfitPct      float64 `json:"profit_pct"`
 }
 
 // wynik pojedynczej próby
@@ -123,9 +125,8 @@ func main() {
 	t0ms := t0.UTC().UnixNano() / 1e6
 
 	// 2) Na ~5s przed T0: synchronizacja czasu + warmup
-	//   warmup na timestamp (teraz -100s)
 	offsetData := httpGet(client, REST_URL+"/api/v3/time", nil, nil)
-	var srv struct{ ServerTime int64 json:"serverTime" }
+	var srv struct{ ServerTime int64 `json:"serverTime"` }
 	must(json.Unmarshal(offsetData, &srv))
 	offset := srv.ServerTime - time.Now().UnixNano()/1e6
 	log.Printf("[SYNC] offset=%dms", offset)
@@ -149,7 +150,7 @@ func main() {
 	// 3) Pobierz ASK z orderbook, oblicz limit-price lub tryb MARKET
 	depthData := httpGet(client, REST_URL+"/api/v3/depth", nil,
 		map[string]string{"symbol": l.Symbol, "limit": "5"})
-	var depth struct{ Asks [][]string json:"asks" }
+	var depth struct{ Asks [][]string `json:"asks"` }
 	must(json.Unmarshal(depthData, &depth))
 
 	mode := "LIMIT"
@@ -181,6 +182,8 @@ func main() {
 	}
 	close(jobs)
 
+	const preciseDelayMs = 0 // ustaw np. -1 lub -2 jeśli trafiasz za późno
+
 	// start workerów
 	done := make(chan struct{})
 	for w := 0; w < len(buyOffsets); w++ {
@@ -189,15 +192,13 @@ func main() {
 				if success.Load() {
 					break
 				}
-				target := t0ms + jb.off
-				busyWait(target - offset)
+				target := t0ms + jb.off + preciseDelayMs
 
-				// zbuduj params
+				// Przygotuj parametry poza busy-wait
 				params := map[string]string{
 					"symbol":     l.Symbol,
 					"side":       "BUY",
 					"recvWindow": "5000",
-					"timestamp":  strconv.FormatInt(time.Now().UnixNano()/1e6+offset, 10),
 				}
 				if mode == "MARKET" {
 					params["type"] = "MARKET"
@@ -208,6 +209,12 @@ func main() {
 					params["quantity"] = fmt.Sprintf("%.6f", qty)
 					params["timeInForce"] = "IOC"
 				}
+
+				// Busy-wait do momentu target
+				busyWait(target - offset)
+
+				// Timestamp i signature generujesz dokładnie w tej ms
+				params["timestamp"] = strconv.FormatInt(time.Now().UnixNano()/1e6+offset, 10)
 				params["signature"] = sign(params, l.APISecret)
 
 				sent := time.Now()
@@ -270,7 +277,7 @@ func main() {
 			time.Sleep(500 * time.Millisecond)
 			d := httpGet(client, REST_URL+"/api/v3/depth", nil,
 				map[string]string{"symbol": l.Symbol, "limit": "5"})
-			var dep struct{ Asks [][]string json:"asks" }
+			var dep struct{ Asks [][]string `json:"asks"` }
 			json.Unmarshal(d, &dep)
 			if len(dep.Asks) > 0 {
 				if first == "" {
