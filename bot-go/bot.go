@@ -118,15 +118,14 @@ func main() {
 	log.Printf("[INFO] %s @ %s, amount=%.4f, markup=%.2f%%, profit=%.2f%%",
 		l.Symbol, l.ListingTime, l.QuoteAmount, l.PriceMarkupPct, l.ProfitPct)
 
-	client := &http.Client{}
-
 	// 1) Oblicz T0 w ms UTC
 	t0, err := time.Parse(time.RFC3339, l.ListingTime)
 	must(err)
 	t0ms := t0.UTC().UnixNano() / 1e6
 
 	// 2) Na ~5s przed T0: synchronizacja czasu + warmup
-	offsetData := httpGet(client, REST_URL+"/api/v3/time", nil, nil)
+	sharedClient := &http.Client{}
+	offsetData := httpGet(sharedClient, REST_URL+"/api/v3/time", nil, nil)
 	var srv struct{ ServerTime int64 `json:"serverTime"` }
 	must(json.Unmarshal(offsetData, &srv))
 	offset := srv.ServerTime - time.Now().UnixNano()/1e6
@@ -142,14 +141,14 @@ func main() {
 		"timestamp":     warmupTs,
 	}
 	warmupParams["signature"] = sign(warmupParams, l.APISecret)
-	httpPost(client, REST_URL+"/api/v3/order", map[string]string{"X-MEXC-APIKEY": l.APIKey}, warmupParams)
+	httpPost(sharedClient, REST_URL+"/api/v3/order", map[string]string{"X-MEXC-APIKEY": l.APIKey}, warmupParams)
 	log.Println("[WARMUP] done")
 
 	// czekaj aż do ~4s przed
 	busyWait(t0ms - 4000 - offset)
 
 	// 3) Pobierz ASK z orderbook, oblicz limit-price lub tryb MARKET
-	depthData := httpGet(client, REST_URL+"/api/v3/depth", nil,
+	depthData := httpGet(sharedClient, REST_URL+"/api/v3/depth", nil,
 		map[string]string{"symbol": l.Symbol, "limit": "5"})
 	var depth struct{ Asks [][]string `json:"asks"` }
 	must(json.Unmarshal(depthData, &depth))
@@ -181,7 +180,9 @@ func main() {
 	done := make(chan struct{}, len(buyOffsets))
 	for i, off := range buyOffsets {
 		go func(idx int, offsetMs int64) {
-			// Przygotuj parametry poza busy-wait
+			// KAŻDA próba: własny http.Client!
+			myClient := &http.Client{}
+
 			params := map[string]string{
 				"symbol":     l.Symbol,
 				"side":       "BUY",
@@ -202,7 +203,7 @@ func main() {
 			params["signature"] = sign(params, l.APISecret)
 
 			sent := time.Now()
-			body := httpPost(client, REST_URL+"/api/v3/order",
+			body := httpPost(myClient, REST_URL+"/api/v3/order",
 				map[string]string{"X-MEXC-APIKEY": l.APIKey}, params)
 			recv := time.Now()
 			lat := float64(recv.Sub(sent).Microseconds()) / 1000.0
@@ -260,7 +261,7 @@ func main() {
 		stag := true
 		for i := 0; i < 6; i++ {
 			time.Sleep(500 * time.Millisecond)
-			d := httpGet(client, REST_URL+"/api/v3/depth", nil,
+			d := httpGet(sharedClient, REST_URL+"/api/v3/depth", nil,
 				map[string]string{"symbol": l.Symbol, "limit": "5"})
 			var dep struct{ Asks [][]string `json:"asks"` }
 			json.Unmarshal(d, &dep)
@@ -304,7 +305,7 @@ func main() {
 	}
 	params["signature"] = sign(params, l.APISecret)
 	startSell := time.Now()
-	httpPost(client, REST_URL+"/api/v3/order",
+	httpPost(sharedClient, REST_URL+"/api/v3/order",
 		map[string]string{"X-MEXC-APIKEY": l.APIKey}, params)
 	latSell := float64(time.Since(startSell).Microseconds()) / 1000.0
 	log.Printf("[SELL] qty=%.6f price=%.8f lat=%.2fms",
