@@ -127,19 +127,31 @@ func main() {
 	must(err)
 	t0ms := t0.UTC().UnixNano() / 1e6
 
-	// 2) Stwórz wspólny transport i trzech klientów (dedykowane połączenia)
-	tr := &http.Transport{
-		MaxIdleConns:        10,
-		MaxIdleConnsPerHost: 10,
+	// --- ZMIANA: 3 osobne transporty i 3 klienci ---
+	tr1 := &http.Transport{
+		MaxIdleConns:        2,
+		MaxIdleConnsPerHost: 2,
+		IdleConnTimeout:     90 * time.Second,
+		DisableKeepAlives:   false,
+	}
+	tr2 := &http.Transport{
+		MaxIdleConns:        2,
+		MaxIdleConnsPerHost: 2,
+		IdleConnTimeout:     90 * time.Second,
+		DisableKeepAlives:   false,
+	}
+	tr3 := &http.Transport{
+		MaxIdleConns:        2,
+		MaxIdleConnsPerHost: 2,
 		IdleConnTimeout:     90 * time.Second,
 		DisableKeepAlives:   false,
 	}
 	clients := []*http.Client{
-		{Transport: tr},
-		{Transport: tr},
-		{Transport: tr},
+		{Transport: tr1},
+		{Transport: tr2},
+		{Transport: tr3},
 	}
-	sharedClient := &http.Client{Transport: tr}
+	sharedClient := &http.Client{Transport: tr1} // Może być tr1, tu nie ma znaczenia
 
 	// 3) Synchronizacja czasu + warmup połączeń (rozgrzej 3 keep-alive TCP/TLS!)
 	offsetData := httpGet(sharedClient, REST_URL+"/api/v3/time", nil, nil)
@@ -148,7 +160,7 @@ func main() {
 	offset := srv.ServerTime - time.Now().UnixNano()/1e6
 	log.Printf("[SYNC] offset=%dms", offset)
 
-	// rozgrzewka 3 połączeń (GET), każde osobnym klientem!
+	// --- ROZGRZEWKA: osobno na każdym kliencie! ---
 	for i := 0; i < 3; i++ {
 		httpGet(clients[i], REST_URL+"/api/v3/time", nil, nil)
 	}
@@ -163,7 +175,7 @@ func main() {
 	}
 	warmupParams["signature"] = sign(warmupParams, l.APISecret)
 	httpPost(sharedClient, REST_URL+"/api/v3/order", map[string]string{"X-MEXC-APIKEY": l.APIKey}, warmupParams)
-	log.Println("[WARMUP] done (keep-alive x3)")
+	log.Println("[WARMUP] done (3 x keep-alive, każdy klient na swoim połączeniu)")
 
 	// czekaj aż do ~4s przed
 	busyWait(t0ms - 4000 - offset)
