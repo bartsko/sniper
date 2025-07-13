@@ -20,9 +20,9 @@ sudo apt update && sudo apt upgrade -y
 # === KROK 1a: brakująca zależność (sqlite3) ===
 sudo apt install -y libsqlite3-dev
 
-# === KROK 2: instalacja Pythona, Git i crona ===
+# === KROK 2: instalacja Pythona, Git, crona, net-tools (netstat do debugowania) ===
 echo "🐍 Instaluję Pythona, Git i Cron..."
-sudo apt install -y python3 python3-pip git cron
+sudo apt install -y python3 python3-pip git cron net-tools
 
 # === KROK 3: uruchomienie i aktywacja crona ===
 echo "🕓 Upewniam się, że cron działa..."
@@ -39,7 +39,7 @@ cd "$BOT_DIR"
 echo "📚 Instaluję zależności..."
 pip3 install -r requirements.txt
 
-# === KROK 6: generuj dynamicznie plik systemd ===
+# === KROK 6: generuj dynamicznie plik systemd (uruchomienie przez uvicorn) ===
 echo "🛠️ Konfiguruję usługę backendu jako systemd..."
 cat <<EOF | sudo tee $SERVICE_PATH > /dev/null
 [Unit]
@@ -50,7 +50,7 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=$BOT_DIR
-ExecStart=$(which python3) $BOT_DIR/server.py
+ExecStart=$(which python3) -m uvicorn server:app --host 0.0.0.0 --port 8000
 Restart=always
 RestartSec=3
 Environment=PYTHONUNBUFFERED=1
@@ -67,5 +67,6 @@ sudo systemctl restart sniper-backend.service
 echo "✅ Instalacja zakończona. Usługa backend działa jako systemd."
 echo "➡️ Sprawdź status: sudo systemctl status sniper-backend.service"
 echo "💡 Test lokalny: curl http://localhost:8000/listings"
+echo "🌍 Test zdalny: curl http://TWOJE_IP_VPS:8000/listings"
 
 cd "$BOT_DIR"
