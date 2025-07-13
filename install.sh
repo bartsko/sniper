@@ -10,7 +10,7 @@ SERVICE_PATH="/etc/systemd/system/sniper-backend.service"
 apt update && apt upgrade -y
 apt install -y git python3 python3-pip golang-go libsqlite3-dev
 
-# === 2) Usuń stary katalog (jeśli przypadkiem jeszcze był) ===
+# === 2) Usuń stary katalog (jeśli istnieje) ===
 rm -rf "$BOT_DIR"
 
 # === 3) Sklonuj repozytorium ===
@@ -24,7 +24,7 @@ pip3 install -r requirements.txt
 # === 5) Go: zbuduj bota ===
 cd bot-go
 go mod tidy
-GOOS=linux GOARCH=amd64 go build -o ../sniper-bot
+GOOS=linux GOARCH=amd64 go build -o ../sniper-bot bot.go
 cd "$BOT_DIR"
 
 # === 6) Skonfiguruj i uruchom FastAPI jako systemd ===
@@ -54,9 +54,11 @@ systemctl enable sniper-backend.service
 systemctl start  sniper-backend.service
 
 # === 7) Podsumowanie ===
+echo
 echo "✅ Backend FastAPI wystartował jako systemd."
-echo "   ➜ Sprawdź: sudo systemctl status sniper-backend.service"
-echo "   ➜ Test lokalny: curl http://localhost:8000/status"
-echo ""
+echo "   → status: sudo systemctl status sniper-backend.service"
+echo "   → test lokalny: curl http://localhost:8000/status"
+echo
 echo "✅ Bot Go zbudowany: $BOT_DIR/sniper-bot"
-echo "   ➜ Możesz wywołać: $BOT_DIR/sniper-bot --help"
+echo "   → dostępne opcje: $BOT_DIR/sniper-bot --help"
+echo
