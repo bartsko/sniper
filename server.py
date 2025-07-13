@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-import json, uuid, subprocess
+import json
+import uuid
+import subprocess
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -11,33 +13,59 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.events import EVENT_JOB_EXECUTED, EVENT_JOB_ERROR
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Ścieżki i konfiguracja
+# ──────────────────────────────────────────────────────────────────────────────
 BASE_DIR      = Path(__file__).parent
 LISTINGS_FILE = BASE_DIR / "listings.json"
 CURRENT_FILE  = BASE_DIR / "current_listing.json"
-BOT_BINARY    = BASE_DIR / "sniper-bot"
+BOT_BINARY    = BASE_DIR / "sniper-bot"        # skompilowana binarka Go
 
+# ──────────────────────────────────────────────────────────────────────────────
+# FastAPI + CORS
+# ──────────────────────────────────────────────────────────────────────────────
 app = FastAPI()
 app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
+# ──────────────────────────────────────────────────────────────────────────────
+# APScheduler z trwałym jobstore SQLite
+# ──────────────────────────────────────────────────────────────────────────────
 jobstores = {'default': SQLAlchemyJobStore(url='sqlite:///jobs.sqlite')}
 scheduler = BackgroundScheduler(jobstores=jobstores, timezone=pytz.UTC)
 
-def _listener(evt):
-    if evt.code == EVENT_JOB_EXECUTED:
-        print(f"[SCHED] Job {evt.job_id} done")
+def _listener(event):
+    if event.code == EVENT_JOB_EXECUTED:
+        print(f"[SCHED] Job {event.job_id} executed")
     else:
-        print(f"[SCHED] Job {evt.job_id} ERROR", evt.exception)
+        print(f"[SCHED] Job {event.job_id} error:", event.exception)
 
 scheduler.add_listener(_listener, EVENT_JOB_EXECUTED | EVENT_JOB_ERROR)
 
 @app.on_event("startup")
-def start_sched():
-    scheduler.start()
-    print("[SCHED] Started. Existing jobs:")
-    for j in scheduler.get_jobs(): print(" ", j)
+def _start_scheduler():
+    if not scheduler.running:
+        scheduler.start()
+        print("[SCHED] Scheduler started. Existing jobs:")
+        for job in scheduler.get_jobs():
+            print("  •", job.id, "->", job.next_run_time)
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Prosty endpoint do sprawdzenia, czy backend działa
+# ──────────────────────────────────────────────────────────────────────────────
+@app.get("/status")
+async def status():
+    return {"ok": True}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Model przychodzącego JSON
+# ──────────────────────────────────────────────────────────────────────────────
 class ListingIn(BaseModel):
     exchange: str
     api_key: str
@@ -48,35 +76,48 @@ class ListingIn(BaseModel):
     profit_pct: int = 200
     listing_time: datetime
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Funkcja uruchamiająca bota Go
+# ──────────────────────────────────────────────────────────────────────────────
 def run_bot(listing_id: str):
-    # zapis pod aktualny listing
+    # Zapisujemy dane listing do current_listing.json
     all_listings = json.loads(LISTINGS_FILE.read_text())
     entry = next(x for x in all_listings if x["id"] == listing_id)
     CURRENT_FILE.write_text(json.dumps(entry, indent=2))
-    # uruchom binarkę Go z argumentem listing_id
+    # Uruchamiamy binarkę Go z argumentem ID
     subprocess.Popen([str(BOT_BINARY), listing_id], cwd=str(BASE_DIR))
-    print(f"[SCHED] Launched bot-for-{listing_id}")
+    print(f"[SCHED] Launched sniper-bot for listing {listing_id}")
+
 
 def job_trigger(listing_id: str):
-    print(f"[SCHED] Trigger for {listing_id}")
+    print(f"[SCHED] Triggering bot for {listing_id}")
     run_bot(listing_id)
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Endpointy CRUD dla listingów
+# ──────────────────────────────────────────────────────────────────────────────
 @app.post("/add_listing")
 async def add_listing(data: ListingIn):
+    # Wczytujemy lub tworzymy listę
     try:
         lst = json.loads(LISTINGS_FILE.read_text())
     except FileNotFoundError:
         lst = []
+    # Dodajemy nowy wpis
     new_id = str(uuid.uuid4())
     ent = data.dict()
     ent["id"] = new_id
     ent["listing_time"] = data.listing_time.isoformat()
     lst.append(ent)
     LISTINGS_FILE.write_text(json.dumps(lst, indent=2))
-    # schedule T0 - 10s
-    t0 = data.listing_time.astimezone(pytz.UTC) - timedelta(seconds=10)
-    scheduler.add_job(job_trigger, 'date', run_date=t0, args=[new_id], id=new_id)
-    return {"status":"ok","id":new_id}
+    # Planowanie joba: 10s przed listing_time
+    run_at = data.listing_time.astimezone(pytz.UTC) - timedelta(seconds=10)
+    scheduler.add_job(job_trigger, 'date', run_date=run_at, args=[new_id], id=new_id)
+    print(f"[SCHED] Scheduled job {new_id} at {run_at.isoformat()}")
+    return {"status": "ok", "id": new_id}
+
 
 @app.get("/listings")
 async def get_listings():
@@ -84,12 +125,16 @@ async def get_listings():
         return json.loads(LISTINGS_FILE.read_text())
     return []
 
-@app.delete("/listings/{lid}")
-async def del_listing(lid:str):
-    if not LISTINGS_FILE.exists(): raise HTTPException(404)
+
+@app.delete("/listings/{listing_id}")
+async def delete_listing(listing_id: str):
+    if not LISTINGS_FILE.exists():
+        raise HTTPException(404, "No listings")
     lst = json.loads(LISTINGS_FILE.read_text())
-    filtered = [x for x in lst if x["id"] != lid]
-    if len(filtered)==len(lst): raise HTTPException(404)
+    filtered = [x for x in lst if x["id"] != listing_id]
+    if len(filtered) == len(lst):
+        raise HTTPException(404, "Not found")
     LISTINGS_FILE.write_text(json.dumps(filtered, indent=2))
-    scheduler.remove_job(lid)
-    return {"status":"ok"}
+    scheduler.remove_job(listing_id)
+    print(f"[SCHED] Removed job {listing_id}")
+    return {"status": "ok"}
