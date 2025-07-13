@@ -23,6 +23,16 @@ const (
 	REST_URL   = "https://api.mexc.com"
 )
 
+// Tabela wyników
+type Result struct {
+	Sent     string
+	Received string
+	Latency  float64
+	Status   string
+	Qty      string
+	Msg      string
+}
+
 func sign(params map[string]string, secret string) string {
 	keys := make([]string, 0, len(params))
 	for k := range params {
@@ -69,7 +79,7 @@ func main() {
 	}
 	client := &http.Client{Transport: tr}
 
-	// 1. Synchronizuj czas z MEXC
+	// 1. Synchronizacja czasu
 	localNow := time.Now().UnixNano() / 1e6
 	mexcNow := getServerTime(client)
 	offset := mexcNow - localNow
@@ -108,7 +118,7 @@ func main() {
 		time.Sleep(1 * time.Millisecond)
 	}
 
-	// 4. Wysyłka zlecenia MARKET (timestamp zsynchronizowany!)
+	// 4. Zlecenie MARKET (synchronizowany timestamp!)
 	params := map[string]string{
 		"symbol":        SYMBOL,
 		"side":          "BUY",
@@ -136,12 +146,34 @@ func main() {
 	defer resp.Body.Close()
 	body, _ := ioutil.ReadAll(resp.Body)
 
-	fmt.Printf("Wysłano: %s\nOdebrano: %s\nLat(ms): %.2f\n", sent.Format("15:04:05.000"), recv.Format("15:04:05.000"), float64(recv.Sub(sent).Microseconds())/1000.0)
-	fmt.Println("Status HTTP:", resp.Status)
-	fmt.Println("Raw body:", string(body))
+	lat := float64(recv.Sub(sent).Microseconds()) / 1000.0
+
+	// Parsowanie odpowiedzi
+	status := "ERROR"
+	qty := ""
+	msg := ""
 	var out map[string]interface{}
 	if json.Unmarshal(body, &out) == nil {
-		fmt.Printf("executedQty: %v\n", out["executedQty"])
-		fmt.Printf("msg: %v\n", out["msg"])
+		if out["executedQty"] != nil {
+			qty = fmt.Sprintf("%v", out["executedQty"])
+			if qty != "0" && qty != "" {
+				status = "OK"
+			} else {
+				status = "NOFILL"
+			}
+		}
+		if out["msg"] != nil {
+			msg = fmt.Sprintf("%v", out["msg"])
+		}
+		if out["code"] != nil && msg == "" {
+			msg = fmt.Sprintf("%v", out["code"])
+		}
 	}
+
+	// --- TABELA ---
+	fmt.Println("\nTabela prób:")
+	fmt.Printf("%-3s | %-12s | %-12s | %-8s | %-8s | %-8s | %s\n", "Nr", "Wysłano", "Odebrano", "Lat(ms)", "Status", "Qty", "Msg")
+	fmt.Println(strings.Repeat("-", 80))
+	fmt.Printf("%-3d | %-12s | %-12s | %8.2f | %-8s | %-8s | %s\n",
+		1, sent.Format("15:04:05.000"), recv.Format("15:04:05.000"), lat, status, qty, msg)
 }
