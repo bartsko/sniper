@@ -1,37 +1,34 @@
 #!/bin/bash
 set -e
 
-# === KONFIGURACJA ===
+# === 0) Ścieżki i zmienne ===
 BOT_DIR="/root/sniper"
 REPO_URL="https://github.com/bartsko/sniper.git"
 SERVICE_PATH="/etc/systemd/system/sniper-backend.service"
 
-# === KROK 0: USUŃ WSZYSTKO Z POPRZEDNIEJ INSTALACJI ===
-sudo systemctl stop sniper-backend.service  || true
-sudo systemctl disable sniper-backend.service || true
-sudo rm -f $SERVICE_PATH
-sudo systemctl daemon-reload
-sudo rm -rf "$BOT_DIR"
+# === 1) Zainstaluj zależności systemowe ===
+apt update && apt upgrade -y
+apt install -y git python3 python3-pip golang-go libsqlite3-dev
 
-# === KROK 1: ZAINSTALUJ DEPENDENCJE SYSTEMOWE ===
-sudo apt update && sudo apt upgrade -y
-sudo apt install -y python3 python3-pip git cron libsqlite3-dev golang-go
+# === 2) Usuń stary katalog (jeśli przypadkiem jeszcze był) ===
+rm -rf "$BOT_DIR"
 
-# === KROK 2: Sklonuj repozytorium i zbuduj aplikacje ===
+# === 3) Sklonuj repozytorium ===
 git clone "$REPO_URL" "$BOT_DIR"
 cd "$BOT_DIR"
 
-# 2a) Pythona: instalacja bibliotek
+# === 4) Python: zainstaluj zależności ===
+pip3 install --upgrade pip
 pip3 install -r requirements.txt
 
-# 2b) Go: kompilacja bota
+# === 5) Go: zbuduj bota ===
 cd bot-go
 go mod tidy
-GOOS=linux GOARCH=amd64 go build -o ../sniper-bot bot.go
-
-# === KROK 3: Utwórz i uruchom usługę FastAPI przez systemd ===
+GOOS=linux GOARCH=amd64 go build -o ../sniper-bot
 cd "$BOT_DIR"
-sudo tee "$SERVICE_PATH" > /dev/null <<EOF
+
+# === 6) Skonfiguruj i uruchom FastAPI jako systemd ===
+cat <<EOF > /tmp/sniper-backend.service
 [Unit]
 Description=Sniper Backend FastAPI Server
 After=network.target
@@ -49,10 +46,17 @@ Environment=PYTHONUNBUFFERED=1
 WantedBy=multi-user.target
 EOF
 
-sudo systemctl daemon-reload
-sudo systemctl enable sniper-backend.service
-sudo systemctl restart sniper-backend.service
+mv /tmp/sniper-backend.service "$SERVICE_PATH"
+chmod 644 "$SERVICE_PATH"
 
-echo "✅ Backend uruchomiony jako systemd."
-echo "➡️  curl http://localhost:8000/status"
-echo "✔️ Bot Go skompilowany: $BOT_DIR/sniper-bot"
+systemctl daemon-reload
+systemctl enable sniper-backend.service
+systemctl start  sniper-backend.service
+
+# === 7) Podsumowanie ===
+echo "✅ Backend FastAPI wystartował jako systemd."
+echo "   ➜ Sprawdź: sudo systemctl status sniper-backend.service"
+echo "   ➜ Test lokalny: curl http://localhost:8000/status"
+echo ""
+echo "✅ Bot Go zbudowany: $BOT_DIR/sniper-bot"
+echo "   ➜ Możesz wywołać: $BOT_DIR/sniper-bot --help"
