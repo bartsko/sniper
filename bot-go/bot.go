@@ -1,5 +1,3 @@
-package main
-
 import (
 	"bytes"
 	"crypto/hmac"
@@ -21,13 +19,13 @@ const REST_URL = "https://api.mexc.com"
 
 // Listing opisany w current_listing.json
 type Listing struct {
-	APIKey         string  `json:"api_key"`
-	APISecret      string  `json:"api_secret"`
-	Symbol         string  `json:"symbol"`
-	QuoteAmount    float64 `json:"quote_amount"`
-	ListingTime    string  `json:"listing_time"`
-	PriceMarkupPct float64 `json:"price_markup_pct"`
-	ProfitPct      float64 `json:"profit_pct"`
+	APIKey         string  json:"api_key"
+	APISecret      string  json:"api_secret"
+	Symbol         string  json:"symbol"
+	QuoteAmount    float64 json:"quote_amount"
+	ListingTime    string  json:"listing_time"
+	PriceMarkupPct float64 json:"price_markup_pct"
+	ProfitPct      float64 json:"profit_pct"
 }
 
 // wynik pojedynczej próby
@@ -102,7 +100,7 @@ func httpPost(client *http.Client, url string, headers, qs map[string]string) []
 	return body
 }
 
-// busy-wait aż epoch-ms osiągnie target
+// busy-wait until epoch-ms reaches target
 func busyWait(targetMs int64) {
 	for time.Now().UnixNano()/1e6 < targetMs {
 	}
@@ -125,8 +123,9 @@ func main() {
 	t0ms := t0.UTC().UnixNano() / 1e6
 
 	// 2) Na ~5s przed T0: synchronizacja czasu + warmup
+	//   warmup na timestamp (teraz -100s)
 	offsetData := httpGet(client, REST_URL+"/api/v3/time", nil, nil)
-	var srv struct{ ServerTime int64 `json:"serverTime"` }
+	var srv struct{ ServerTime int64 json:"serverTime" }
 	must(json.Unmarshal(offsetData, &srv))
 	offset := srv.ServerTime - time.Now().UnixNano()/1e6
 	log.Printf("[SYNC] offset=%dms", offset)
@@ -144,13 +143,13 @@ func main() {
 	httpPost(client, REST_URL+"/api/v3/order", map[string]string{"X-MEXC-APIKEY": l.APIKey}, warmupParams)
 	log.Println("[WARMUP] done")
 
-	// 3) Czekaj aż do ~4s przed T0
+	// czekaj aż do ~4s przed
 	busyWait(t0ms - 4000 - offset)
 
-	// 4) Pobierz orderbook i oblicz tryb LIMIT/MARKET
+	// 3) Pobierz ASK z orderbook, oblicz limit-price lub tryb MARKET
 	depthData := httpGet(client, REST_URL+"/api/v3/depth", nil,
 		map[string]string{"symbol": l.Symbol, "limit": "5"})
-	var depth struct{ Asks [][]string `json:"asks"` }
+	var depth struct{ Asks [][]string json:"asks" }
 	must(json.Unmarshal(depthData, &depth))
 
 	mode := "LIMIT"
@@ -169,18 +168,20 @@ func main() {
 		qty = math.Round(l.QuoteAmount/limitPrice*1e6) / 1e6
 	}
 
-	// 5) Przygotuj offsety i kanał zadań
+	// 4) Przygotuj próby: T0-10ms, -5ms, 0ms
 	buyOffsets := []int64{-10, -5, 0}
 	var success atomic.Bool
 	var results []attemptResult
-	type job struct{ off int64 }
+
+	// 5) Wyślij trzy próby równolegle, ale bez blokowania kolejki
+	type job struct{ off int64; idx int }
 	jobs := make(chan job, len(buyOffsets))
-	for _, off := range buyOffsets {
-		jobs <- job{off}
+	for i, off := range buyOffsets {
+		jobs <- job{off, i}
 	}
 	close(jobs)
 
-	// 6) Uruchom workerów równolegle
+	// start workerów
 	done := make(chan struct{})
 	for w := 0; w < len(buyOffsets); w++ {
 		go func() {
@@ -237,20 +238,20 @@ func main() {
 					Msg:     msg,
 				})
 
-				log.Printf("[TRY] off=%+dms sent=%s recv=%s lat=%.2fms stat=%s qty=%.6f msg=%s",
-					jb.off, sent.Format("15:04:05.000"), recv.Format("15:04:05.000"),
+				log.Printf("[TRY] sent=%s recv=%s lat=%.2fms stat=%s qty=%.6f msg=%s",
+					sent.Format("15:04:05.000"), recv.Format("15:04:05.000"),
 					lat, stat, execQty, msg)
 			}
 			done <- struct{}{}
 		}()
 	}
 
-	// poczekaj na zakończenie wszystkich workerów
+	// czekaj aż wszyscy pracownicy skończą
 	for i := 0; i < len(buyOffsets); i++ {
 		<-done
 	}
 
-	// 7) Wyświetl tabelę prób
+	// 6) Logowanie tabelą
 	fmt.Println("\n📊 Tabela prób:")
 	fmt.Printf("%-3s | %-12s | %-12s | %-8s | %-6s | %-9s | %-11s | %s\n",
 		"Nr", "Wysłano", "Odebrano", "Lat(ms)", "Status", "Qty", "Price", "Msg")
@@ -260,16 +261,16 @@ func main() {
 			i+1, a.Sent, a.Recv, a.Latency, a.Status, a.Qty, a.Price, a.Msg)
 	}
 
-	// 8) Jeżeli żaden LIMIT nie zwrócił OK → sprawdzamy stagnację 3s
+	// 7) Jeżeli żaden nie był OK → stagnacja?
 	if !success.Load() && mode == "LIMIT" {
 		log.Println("[BOT] wszystkie LIMIT próby NOFILL → sprawdzam stagnację 3s")
 		first := ""
 		stag := true
-		for i := 0; i < 6; i++ { // 6×500 ms = 3 s
+		for i := 0; i < 6; i++ {
 			time.Sleep(500 * time.Millisecond)
 			d := httpGet(client, REST_URL+"/api/v3/depth", nil,
 				map[string]string{"symbol": l.Symbol, "limit": "5"})
-			var dep struct{ Asks [][]string `json:"asks"` }
+			var dep struct{ Asks [][]string json:"asks" }
 			json.Unmarshal(d, &dep)
 			if len(dep.Asks) > 0 {
 				if first == "" {
@@ -281,21 +282,22 @@ func main() {
 			}
 		}
 		if stag {
-			log.Println("[BOT] STAGNACJA → zaplanuj ponowny BUY za 10 min")
-			// tutaj schedulerem możesz zapisać zadanie na T0+10min−5s
+			log.Println("[BOT] STAGNACJA → zaplanuj ponowny BUY za 10min")
 		} else {
 			log.Println("[BOT] cena ruszyła → kończę no buy")
+		}
+		if stag {
+			// tutaj możesz rzucić schedulerem na t0+10m-5s
 		}
 		return
 	}
 
-	// 9) Jeśli wciąż no buy (MARKET fallback) → koniec
 	if !success.Load() {
-		log.Println("[BOT] no buy (MARKET też nie wypalił)")
+		log.Println("[BOT] no buy (MARKET fallback też się nie udał)")
 		return
 	}
 
-	// 10) SELL TP natychmiast po pierwszym OK
+	// 8) SELL TP natychmiast po pierwszym OK
 	sellPrice := math.Round(limitPrice*(1+l.ProfitPct/100)*1e8) / 1e8
 	sellQty := math.Round(qty*1e6) / 1e6
 	params := map[string]string{
