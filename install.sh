@@ -1,8 +1,12 @@
 #!/bin/bash
 
 # === KONFIGURACJA ===
-BOT_DIR="$HOME/sniper"
+BOT_DIR="/root/sniper"
 REPO_URL="https://github.com/bartsko/sniper.git"
+SERVICE_FILE="sniper-backend.service"
+SERVICE_PATH="/etc/systemd/system/sniper-backend.service"
+
+set -e
 
 # === KROK 1: aktualizacja systemu ===
 echo "🔧 Aktualizuję system..."
@@ -27,9 +31,14 @@ git clone "$REPO_URL" .
 echo "📚 Instaluję zależności..."
 pip3 install -r requirements.txt
 
-# === KROK 6: zakończenie ===
-echo "✅ Instalacja zakończona. Boty dostępne w: $BOT_DIR"
-echo "📌 Użyj scheduler.py, aby zaplanować snajp na listingu."
+# === KROK 6: kopiowanie pliku serwisowego ===
+echo "🛠️ Konfiguruję usługę backendu jako systemd..."
+sudo cp "$BOT_DIR/$SERVICE_FILE" "$SERVICE_PATH"
 
-echo "💡 Przykład:"
-echo "python3 scheduler/scheduler.py --exchange mexc --symbol XYZ/USDT --time '2025-07-09 11:00:00' --timezone Europe/Warsaw --amount 20 --roi 10"
+# === KROK 7: reload + enable + start usługi ===
+sudo systemctl daemon-reload
+sudo systemctl enable sniper-backend.service
+sudo systemctl restart sniper-backend.service
+
+echo "✅ Instalacja zakończona. Usługa backend działa jako systemd."
+echo "➡️ Sprawdź status: sudo systemctl status sniper-backend.service"
