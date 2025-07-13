@@ -3,10 +3,13 @@ Description=Sniper Backend FastAPI Server
 After=network.target
 
 [Service]
+Type=simple
 User=root
 WorkingDirectory=/root/sniper
 ExecStart=/usr/bin/python3 /root/sniper/server.py
 Restart=always
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
 
 [Install]
 WantedBy=multi-user.target
