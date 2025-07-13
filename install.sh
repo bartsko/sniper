@@ -67,3 +67,5 @@ sudo systemctl restart sniper-backend.service
 echo "✅ Instalacja zakończona. Usługa backend działa jako systemd."
 echo "➡️ Sprawdź status: sudo systemctl status sniper-backend.service"
 echo "💡 Test lokalny: curl http://localhost:8000/listings"
+
+cd "$BOT_DIR"
