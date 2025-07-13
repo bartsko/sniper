@@ -1,24 +1,25 @@
 package main
 
 import (
-	"bytes"
-	"crypto/hmac"
-	"crypto/sha256"
+	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"math"
-	"net/http"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/mexcdevelop/mexc-api-sdk-go/spot"
 )
 
-const REST_URL = "https://api.mexc.com"
+const (
+	REST_URL = "https://api.mexc.com"
+)
 
 // Listing opisany w current_listing.json
 type Listing struct {
@@ -42,68 +43,7 @@ type attemptResult struct {
 	Msg     string
 }
 
-func must(err error) {
-	if err != nil {
-		log.Fatal(err)
-	}
-}
-
-// podpis HMAC SHA256 alfabetycznie posortowanych parametrów
-func sign(params map[string]string, secret string) string {
-	keys := make([]string, 0, len(params))
-	for k := range params {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	var buf bytes.Buffer
-	for i, k := range keys {
-		if i > 0 {
-			buf.WriteString("&")
-		}
-		buf.WriteString(fmt.Sprintf("%s=%s", k, params[k]))
-	}
-	mac := hmac.New(sha256.New, []byte(secret))
-	mac.Write(buf.Bytes())
-	return fmt.Sprintf("%x", mac.Sum(nil))
-}
-
-func httpGet(client *http.Client, url string, headers, qs map[string]string) []byte {
-	req, _ := http.NewRequest("GET", url, nil)
-	q := req.URL.Query()
-	for k, v := range qs {
-		q.Set(k, v)
-	}
-	req.URL.RawQuery = q.Encode()
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
-	resp, err := client.Do(req)
-	must(err)
-	defer resp.Body.Close()
-	data, err := ioutil.ReadAll(resp.Body)
-	must(err)
-	return data
-}
-
-func httpPost(client *http.Client, url string, headers, qs map[string]string) []byte {
-	req, _ := http.NewRequest("POST", url, nil)
-	q := req.URL.Query()
-	for k, v := range qs {
-		q.Set(k, v)
-	}
-	req.URL.RawQuery = q.Encode()
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
-	resp, err := client.Do(req)
-	must(err)
-	defer resp.Body.Close()
-	body, err := ioutil.ReadAll(resp.Body)
-	must(err)
-	return body
-}
-
-// busy-wait until epoch-ms reaches target
+// Busy-wait until epoch-ms reaches target
 func busyWait(targetMs int64) {
 	sleepMs := targetMs - time.Now().UnixNano()/1e6 - 2
 	if sleepMs > 0 {
@@ -113,9 +53,15 @@ func busyWait(targetMs int64) {
 	}
 }
 
+func must(err error) {
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
 func main() {
 	// 0) Wczytaj listing
-	data, err := ioutil.ReadFile("current_listing.json")
+	data, err := os.ReadFile("current_listing.json")
 	must(err)
 	var l Listing
 	must(json.Unmarshal(data, &l))
@@ -127,65 +73,33 @@ func main() {
 	must(err)
 	t0ms := t0.UTC().UnixNano() / 1e6
 
-	// --- ZMIANA: 3 osobne transporty i 3 klienci ---
-	tr1 := &http.Transport{
-		MaxIdleConns:        2,
-		MaxIdleConnsPerHost: 2,
-		IdleConnTimeout:     90 * time.Second,
-		DisableKeepAlives:   false,
-	}
-	tr2 := &http.Transport{
-		MaxIdleConns:        2,
-		MaxIdleConnsPerHost: 2,
-		IdleConnTimeout:     90 * time.Second,
-		DisableKeepAlives:   false,
-	}
-	tr3 := &http.Transport{
-		MaxIdleConns:        2,
-		MaxIdleConnsPerHost: 2,
-		IdleConnTimeout:     90 * time.Second,
-		DisableKeepAlives:   false,
-	}
-	clients := []*http.Client{
-		{Transport: tr1},
-		{Transport: tr2},
-		{Transport: tr3},
-	}
-	sharedClient := &http.Client{Transport: tr1} // Może być tr1, tu nie ma znaczenia
+	// 2) Utwórz klienta SDK
+	client := spot.NewClient(l.APIKey, l.APISecret)
 
-	// 3) Synchronizacja czasu + warmup połączeń (rozgrzej 3 keep-alive TCP/TLS!)
-	offsetData := httpGet(sharedClient, REST_URL+"/api/v3/time", nil, nil)
-	var srv struct{ ServerTime int64 `json:"serverTime"` }
-	must(json.Unmarshal(offsetData, &srv))
-	offset := srv.ServerTime - time.Now().UnixNano()/1e6
+	// 3) Synchronizacja czasu
+	serverTime, err := client.Common.ServerTime(context.Background())
+	must(err)
+	offset := serverTime - time.Now().UTC().UnixMilli()
 	log.Printf("[SYNC] offset=%dms", offset)
 
-	// --- ROZGRZEWKA: osobno na każdym kliencie! ---
-	for i := 0; i < 3; i++ {
-		httpGet(clients[i], REST_URL+"/api/v3/time", nil, nil)
+	// 4) Rozgrzewka połączenia (pobierz czas, micro order)
+	_, _ = client.Common.ServerTime(context.Background())
+	warmupParams := spot.PlaceOrderParams{
+		Symbol:        l.Symbol,
+		Side:          "BUY",
+		Type:          "MARKET",
+		QuoteOrderQty: "0.000001",
+		RecvWindow:    2000,
 	}
-	warmupTs := strconv.FormatInt(time.Now().UnixNano()/1e6+offset-100000, 10)
-	warmupParams := map[string]string{
-		"symbol":        l.Symbol,
-		"side":          "BUY",
-		"type":          "MARKET",
-		"quoteOrderQty": "0.000001",
-		"recvWindow":    "2000",
-		"timestamp":     warmupTs,
-	}
-	warmupParams["signature"] = sign(warmupParams, l.APISecret)
-	httpPost(sharedClient, REST_URL+"/api/v3/order", map[string]string{"X-MEXC-APIKEY": l.APIKey}, warmupParams)
-	log.Println("[WARMUP] done (3 x keep-alive, każdy klient na swoim połączeniu)")
+	_, _ = client.Order.PlaceOrder(context.Background(), warmupParams)
+	log.Println("[WARMUP] done (SDK keep-alive)")
 
 	// czekaj aż do ~4s przed
 	busyWait(t0ms - 4000 - offset)
 
-	// 4) Pobierz ASK z orderbook, oblicz limit-price lub tryb MARKET
-	depthData := httpGet(sharedClient, REST_URL+"/api/v3/depth", nil,
-		map[string]string{"symbol": l.Symbol, "limit": "5"})
-	var depth struct{ Asks [][]string `json:"asks"` }
-	must(json.Unmarshal(depthData, &depth))
-
+	// 5) Pobierz ASK z orderbook przez SDK, oblicz limit-price lub tryb MARKET
+	depth, err := client.Market.Depth(context.Background(), l.Symbol, 5)
+	must(err)
 	mode := "LIMIT"
 	var limitPrice float64
 	if len(depth.Asks) == 0 {
@@ -202,7 +116,7 @@ func main() {
 		qty = math.Round(l.QuoteAmount/limitPrice*1e6) / 1e6
 	}
 
-	// 5) Przygotuj próby: T0-10ms, -5ms, 0ms
+	// 6) Przygotuj próby: T0-10ms, -5ms, 0ms (SDK PlaceOrder)
 	buyOffsets := []int64{-10, -5, 0}
 	var success atomic.Bool
 	var results []attemptResult
@@ -212,45 +126,50 @@ func main() {
 
 	done := make(chan struct{}, len(buyOffsets))
 	for i, off := range buyOffsets {
-		myClient := clients[i]
-		go func(idx int, offsetMs int64, cli *http.Client) {
-			params := map[string]string{
-				"symbol":     l.Symbol,
-				"side":       "BUY",
-				"recvWindow": "5000",
-			}
+		go func(idx int, offsetMs int64) {
+			var params spot.PlaceOrderParams
 			if mode == "MARKET" {
-				params["type"] = "MARKET"
-				params["quoteOrderQty"] = fmt.Sprintf("%.6f", l.QuoteAmount)
+				params = spot.PlaceOrderParams{
+					Symbol:        l.Symbol,
+					Side:          "BUY",
+					Type:          "MARKET",
+					QuoteOrderQty: fmt.Sprintf("%.6f", l.QuoteAmount),
+					RecvWindow:    5000,
+				}
 			} else {
-				params["type"] = "LIMIT"
-				params["price"] = fmt.Sprintf("%.8f", limitPrice)
-				params["quantity"] = fmt.Sprintf("%.6f", qty)
-				params["timeInForce"] = "IOC"
+				params = spot.PlaceOrderParams{
+					Symbol:      l.Symbol,
+					Side:        "BUY",
+					Type:        "LIMIT",
+					Price:       fmt.Sprintf("%.8f", limitPrice),
+					Quantity:    fmt.Sprintf("%.6f", qty),
+					TimeInForce: "IOC",
+					RecvWindow:  5000,
+				}
 			}
 			target := t0ms + offsetMs + preciseDelayMs
 			busyWait(target - offset)
-			params["timestamp"] = strconv.FormatInt(time.Now().UnixNano()/1e6+offset, 10)
-			params["signature"] = sign(params, l.APISecret)
-
 			sent := time.Now()
-			body := httpPost(cli, REST_URL+"/api/v3/order",
-				map[string]string{"X-MEXC-APIKEY": l.APIKey}, params)
+			orderResp, err := client.Order.PlaceOrder(context.Background(), params)
 			recv := time.Now()
 			lat := float64(recv.Sub(sent).Microseconds()) / 1000.0
 
-			var resp map[string]interface{}
-			json.Unmarshal(body, &resp)
-
 			stat := "NOFILL"
 			execQty := 0.0
-			if v, ok := resp["executedQty"].(float64); ok && v > 0 {
-				execQty = v
-				stat = "OK"
-				success.Store(true)
+			if err == nil && orderResp.ExecutedQty != "" {
+				v, _ := strconv.ParseFloat(orderResp.ExecutedQty, 64)
+				if v > 0 {
+					execQty = v
+					stat = "OK"
+					success.Store(true)
+				}
 			}
-			msg := fmt.Sprint(resp["msg"])
-
+			msg := ""
+			if err != nil {
+				msg = err.Error()
+			} else if orderResp.Msg != "" {
+				msg = orderResp.Msg
+			}
 			resultsMu.Lock()
 			results = append(results, attemptResult{
 				Sent:    sent.Format("15:04:05.000"),
@@ -262,20 +181,18 @@ func main() {
 				Msg:     msg,
 			})
 			resultsMu.Unlock()
-
 			log.Printf("[TRY] sent=%s recv=%s lat=%.2fms stat=%s qty=%.6f msg=%s",
 				sent.Format("15:04:05.000"), recv.Format("15:04:05.000"),
 				lat, stat, execQty, msg)
 			done <- struct{}{}
-		}(i, off, myClient)
+		}(i, off)
 	}
 
-	// czekaj aż wszyscy pracownicy skończą
 	for i := 0; i < len(buyOffsets); i++ {
 		<-done
 	}
 
-	// 6) Logowanie tabelą
+	// 7) Logowanie tabelą
 	fmt.Println("\n📊 Tabela prób:")
 	fmt.Printf("%-3s | %-12s | %-12s | %-8s | %-6s | %-9s | %-11s | %s\n",
 		"Nr", "Wysłano", "Odebrano", "Lat(ms)", "Status", "Qty", "Price", "Msg")
@@ -285,21 +202,18 @@ func main() {
 			i+1, a.Sent, a.Recv, a.Latency, a.Status, a.Qty, a.Price, a.Msg)
 	}
 
-	// 7) Jeżeli żaden nie był OK → stagnacja?
+	// 8) Jeżeli żaden nie był OK → stagnacja?
 	if !success.Load() && mode == "LIMIT" {
 		log.Println("[BOT] wszystkie LIMIT próby NOFILL → sprawdzam stagnację 3s")
 		first := ""
 		stag := true
 		for i := 0; i < 6; i++ {
 			time.Sleep(500 * time.Millisecond)
-			d := httpGet(sharedClient, REST_URL+"/api/v3/depth", nil,
-				map[string]string{"symbol": l.Symbol, "limit": "5"})
-			var dep struct{ Asks [][]string `json:"asks"` }
-			json.Unmarshal(d, &dep)
-			if len(dep.Asks) > 0 {
+			depth, _ := client.Market.Depth(context.Background(), l.Symbol, 5)
+			if len(depth.Asks) > 0 {
 				if first == "" {
-					first = dep.Asks[0][0]
-				} else if dep.Asks[0][0] != first {
+					first = depth.Asks[0][0]
+				} else if depth.Asks[0][0] != first {
 					stag = false
 					break
 				}
@@ -321,23 +235,20 @@ func main() {
 		return
 	}
 
-	// 8) SELL TP natychmiast po pierwszym OK
+	// 9) SELL TP natychmiast po pierwszym OK
 	sellPrice := math.Round(limitPrice*(1+l.ProfitPct/100)*1e8) / 1e8
 	sellQty := math.Round(qty*1e6) / 1e6
-	params := map[string]string{
-		"symbol":      l.Symbol,
-		"side":        "SELL",
-		"type":        "LIMIT",
-		"price":       fmt.Sprintf("%.8f", sellPrice),
-		"quantity":    fmt.Sprintf("%.6f", sellQty),
-		"timeInForce": "GTC",
-		"recvWindow":  "5000",
-		"timestamp":   strconv.FormatInt(time.Now().UnixNano()/1e6+offset, 10),
+	params := spot.PlaceOrderParams{
+		Symbol:      l.Symbol,
+		Side:        "SELL",
+		Type:        "LIMIT",
+		Price:       fmt.Sprintf("%.8f", sellPrice),
+		Quantity:    fmt.Sprintf("%.6f", sellQty),
+		TimeInForce: "GTC",
+		RecvWindow:  5000,
 	}
-	params["signature"] = sign(params, l.APISecret)
 	startSell := time.Now()
-	httpPost(sharedClient, REST_URL+"/api/v3/order",
-		map[string]string{"X-MEXC-APIKEY": l.APIKey}, params)
+	_, _ = client.Order.PlaceOrder(context.Background(), params)
 	latSell := float64(time.Since(startSell).Microseconds()) / 1000.0
 	log.Printf("[SELL] qty=%.6f price=%.8f lat=%.2fms",
 		sellQty, sellPrice, latSell)
