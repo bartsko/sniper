@@ -1,16 +1,24 @@
 #!/bin/bash
 
+set -e
+
 # === KONFIGURACJA ===
 BOT_DIR="/root/sniper"
 REPO_URL="https://github.com/bartsko/sniper.git"
-SERVICE_FILE="sniper-backend.service"
 SERVICE_PATH="/etc/systemd/system/sniper-backend.service"
 
-set -e
+# === KROK 0: usuń poprzednią instalkę (opcjonalnie) ===
+if [ -d "$BOT_DIR" ]; then
+  echo "⚠️  Uwaga: katalog $BOT_DIR już istnieje. Usuwam dla czystej instalacji..."
+  rm -rf "$BOT_DIR"
+fi
 
 # === KROK 1: aktualizacja systemu ===
 echo "🔧 Aktualizuję system..."
 sudo apt update && sudo apt upgrade -y
+
+# === KROK 1a: brakująca zależność (sqlite3) ===
+sudo apt install -y libsqlite3-dev
 
 # === KROK 2: instalacja Pythona, Git i crona ===
 echo "🐍 Instaluję Pythona, Git i Cron..."
@@ -24,16 +32,32 @@ sudo systemctl start cron
 # === KROK 4: klonowanie repo ===
 echo "📦 Klonuję repozytorium..."
 mkdir -p "$BOT_DIR"
+git clone "$REPO_URL" "$BOT_DIR"
 cd "$BOT_DIR"
-git clone "$REPO_URL" .
 
 # === KROK 5: instalacja zależności Pythona ===
 echo "📚 Instaluję zależności..."
 pip3 install -r requirements.txt
 
-# === KROK 6: kopiowanie pliku serwisowego ===
+# === KROK 6: generuj dynamicznie plik systemd ===
 echo "🛠️ Konfiguruję usługę backendu jako systemd..."
-sudo cp "$BOT_DIR/$SERVICE_FILE" "$SERVICE_PATH"
+cat <<EOF | sudo tee $SERVICE_PATH > /dev/null
+[Unit]
+Description=Sniper Backend FastAPI Server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=$BOT_DIR
+ExecStart=$(which python3) $BOT_DIR/server.py
+Restart=always
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
+EOF
 
 # === KROK 7: reload + enable + start usługi ===
 sudo systemctl daemon-reload
@@ -42,3 +66,4 @@ sudo systemctl restart sniper-backend.service
 
 echo "✅ Instalacja zakończona. Usługa backend działa jako systemd."
 echo "➡️ Sprawdź status: sudo systemctl status sniper-backend.service"
+echo "💡 Test lokalny: curl http://localhost:8000/listings"
