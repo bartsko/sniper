@@ -11,55 +11,33 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.events import EVENT_JOB_EXECUTED, EVENT_JOB_ERROR
 
-# —————————————————————————————————————————————
-# Ścieżki i skrypty
-BASE_DIR       = Path(__file__).parent
-LISTINGS_FILE  = BASE_DIR / "listings.json"
-CURRENT_FILE   = BASE_DIR / "current_listing.json"
-BOT_SCRIPT     = BASE_DIR / "bot.py"
+BASE_DIR      = Path(__file__).parent
+LISTINGS_FILE = BASE_DIR / "listings.json"
+CURRENT_FILE  = BASE_DIR / "current_listing.json"
+BOT_BINARY    = BASE_DIR / "sniper-bot"
 
-# —————————————————————————————————————————————
-# FastAPI + CORS
 app = FastAPI()
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
 )
 
-# —————————————————————————————————————————————
-# APScheduler z trwałym jobstore
 jobstores = {'default': SQLAlchemyJobStore(url='sqlite:///jobs.sqlite')}
 scheduler = BackgroundScheduler(jobstores=jobstores, timezone=pytz.UTC)
 
-# Listener, aby widzieć wykonanie lub błędy zadań
-def _listener(event):
-    if event.code == EVENT_JOB_EXECUTED:
-        print(f"[SCHED-EVENT] Job {event.job_id} executed")
-    elif event.code == EVENT_JOB_ERROR:
-        print(f"[SCHED-EVENT] Job {event.job_id} error:", event.exception)
+def _listener(evt):
+    if evt.code == EVENT_JOB_EXECUTED:
+        print(f"[SCHED] Job {evt.job_id} done")
+    else:
+        print(f"[SCHED] Job {evt.job_id} ERROR", evt.exception)
 
 scheduler.add_listener(_listener, EVENT_JOB_EXECUTED | EVENT_JOB_ERROR)
 
-# —————————————————————————————————————————————
-# Funkcja pomocnicza dumpująca joby
-def dump_jobs(label: str):
-    print(f"[SCHED] {label}:")
-    for job in scheduler.get_jobs():
-        print(f"  • {job.id} -> next_run_time={job.next_run_time}")
-
-# —————————————————————————————————————————————
-# Start schedulera na starcie FastAPI
 @app.on_event("startup")
-def _start_scheduler():
-    if not scheduler.running:
-        scheduler.start()
-        print("[SCHED] Scheduler started")
-        dump_jobs("Jobs at startup")
+def start_sched():
+    scheduler.start()
+    print("[SCHED] Started. Existing jobs:")
+    for j in scheduler.get_jobs(): print(" ", j)
 
-# —————————————————————————————————————————————
-# Model przychodzącego JSON
 class ListingIn(BaseModel):
     exchange: str
     api_key: str
@@ -70,72 +48,35 @@ class ListingIn(BaseModel):
     profit_pct: int = 200
     listing_time: datetime
 
-# —————————————————————————————————————————————
-# Uruchomienie bot.py dla pojedynczego listing
-def run_bot(listing: dict):
-    with open(CURRENT_FILE, "w", encoding="utf-8") as f:
-        json.dump(listing, f, indent=2)
-    proc = subprocess.Popen(
-        ["python3", str(BOT_SCRIPT)],
-        cwd=str(BASE_DIR)
-    )
-    print(f"[SCHED] Launched bot.py (pid {proc.pid}) for listing {listing['id']}")
+def run_bot(listing_id: str):
+    # zapis pod aktualny listing
+    all_listings = json.loads(LISTINGS_FILE.read_text())
+    entry = next(x for x in all_listings if x["id"] == listing_id)
+    CURRENT_FILE.write_text(json.dumps(entry, indent=2))
+    # uruchom binarkę Go z argumentem listing_id
+    subprocess.Popen([str(BOT_BINARY), listing_id], cwd=str(BASE_DIR))
+    print(f"[SCHED] Launched bot-for-{listing_id}")
 
-# —————————————————————————————————————————————
-# Funkcja wywoływana przez APScheduler
-def start_bot_job(listing_id: str):
-    dump_jobs("Jobs at trigger")
-    if not LISTINGS_FILE.exists():
-        return
-    all_l = json.loads(LISTINGS_FILE.read_text())
-    entry = next((l for l in all_l if l.get("id") == listing_id), None)
-    if not entry:
-        print(f"[SCHED] Listing {listing_id} not found")
-        return
-    print(f"[SCHED] Triggering bot for {entry['symbol']} @ {entry['listing_time']}")
-    run_bot(entry)
+def job_trigger(listing_id: str):
+    print(f"[SCHED] Trigger for {listing_id}")
+    run_bot(listing_id)
 
-# —————————————————————————————————————————————
-# Dodanie zadania do schedulera
-def schedule_bot_job(listing_id: str, listing_time: datetime):
-    # wymuś timezone UTC jeśli brakuje
-    if listing_time.tzinfo is None:
-        listing_time = listing_time.replace(tzinfo=pytz.UTC)
-    run_at = listing_time.astimezone(pytz.UTC) - timedelta(seconds=10)
-    now   = datetime.now(pytz.UTC)
-    if run_at <= now:
-        print(f"[SCHED] Too late to schedule {listing_id}")
-        return
-    job_id = f"bot-for-{listing_id}"
-    scheduler.add_job(
-        start_bot_job,
-        'date',
-        run_date=run_at,
-        args=[listing_id],
-        id=job_id,
-        replace_existing=True
-    )
-    print(f"[SCHED] Scheduled {listing_id} at {run_at.isoformat()}")
-    dump_jobs("Jobs after scheduling")
-
-# —————————————————————————————————————————————
-# Endpoints
 @app.post("/add_listing")
-async def add_listing(payload: ListingIn):
+async def add_listing(data: ListingIn):
     try:
         lst = json.loads(LISTINGS_FILE.read_text())
     except FileNotFoundError:
         lst = []
     new_id = str(uuid.uuid4())
-    entry = payload.dict()
-    entry["id"]           = new_id
-    entry["listing_time"] = payload.listing_time.isoformat()
-    lst.append(entry)
-    with open(LISTINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(lst, f, indent=2)
-
-    schedule_bot_job(new_id, payload.listing_time)
-    return {"status": "ok", "id": new_id}
+    ent = data.dict()
+    ent["id"] = new_id
+    ent["listing_time"] = data.listing_time.isoformat()
+    lst.append(ent)
+    LISTINGS_FILE.write_text(json.dumps(lst, indent=2))
+    # schedule T0 - 10s
+    t0 = data.listing_time.astimezone(pytz.UTC) - timedelta(seconds=10)
+    scheduler.add_job(job_trigger, 'date', run_date=t0, args=[new_id], id=new_id)
+    return {"status":"ok","id":new_id}
 
 @app.get("/listings")
 async def get_listings():
@@ -143,17 +84,12 @@ async def get_listings():
         return json.loads(LISTINGS_FILE.read_text())
     return []
 
-@app.delete("/listings/{listing_id}")
-async def delete_listing(listing_id: str):
-    if not LISTINGS_FILE.exists():
-        raise HTTPException(404, "No listings")
+@app.delete("/listings/{lid}")
+async def del_listing(lid:str):
+    if not LISTINGS_FILE.exists(): raise HTTPException(404)
     lst = json.loads(LISTINGS_FILE.read_text())
-    filtered = [l for l in lst if l.get("id") != listing_id]
-    if len(filtered) == len(lst):
-        raise HTTPException(404, "Not found")
-    with open(LISTINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(filtered, f, indent=2)
-    job_id = f"bot-for-{listing_id}"
-    if scheduler.get_job(job_id):
-        scheduler.remove_job(job_id)
-    return {"status": "ok"}
+    filtered = [x for x in lst if x["id"] != lid]
+    if len(filtered)==len(lst): raise HTTPException(404)
+    LISTINGS_FILE.write_text(json.dumps(filtered, indent=2))
+    scheduler.remove_job(lid)
+    return {"status":"ok"}
