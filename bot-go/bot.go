@@ -1,279 +1,190 @@
-package main
+#!/usr/bin/env python3
+import asyncio, time, hmac, hashlib, json
+from datetime import datetime, timezone
+from pathlib import Path
 
-import (
-    "bytes"
-    "crypto/hmac"
-    "crypto/sha256"
-    "encoding/json"
-    "fmt"
-    "io/ioutil"
-    "log"
-    "math"
-    "net/http"
-    "sort"
-    "strconv"
-    "sync/atomic"
-    "time"
-)
+import httpx
 
-const REST_URL = "https://api.mexc.com"
+# ──────────────────────────────────────────────────────────────────────────────
+#  Load the scheduled listing from JSON
+# ──────────────────────────────────────────────────────────────────────────────
+CURRENT_FILE = Path("current_listing.json")
+if not CURRENT_FILE.exists():
+    raise FileNotFoundError(f"{CURRENT_FILE} not found")
 
-type Listing struct {
-    APIKey         string  `json:"api_key"`
-    APISecret      string  `json:"api_secret"`
-    Symbol         string  `json:"symbol"`
-    QuoteAmount    float64 `json:"quote_amount"`
-    ListingTime    string  `json:"listing_time"`
-    PriceMarkupPct float64 `json:"price_markup_pct"`
-    ProfitPct      float64 `json:"profit_pct"`
-}
+with open(CURRENT_FILE, "r", encoding="utf-8") as f:
+    listing = json.load(f)
 
-func must(err error) {
-    if err != nil {
-        log.Fatal(err)
+API_KEY          = listing["api_key"]
+API_SECRET       = listing["api_secret"]
+SYMBOL           = listing["symbol"].upper()
+QUOTE_AMOUNT     = float(listing["quote_amount"])
+LISTING_TIME     = listing["listing_time"]
+PRICE_MARKUP_PCT = float(listing.get("price_markup_pct", 20))
+PROFIT_PCT       = float(listing.get("profit_pct", 200))
+
+REST_URL = "https://api.mexc.com"
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Helpers
+# ──────────────────────────────────────────────────────────────────────────────
+def sign(params: dict, secret: str) -> str:
+    qs = "&".join(f"{k}={params[k]}" for k in sorted(params))
+    return hmac.new(secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
+
+def busy_wait_until(target_ms: int):
+    while int(time.time() * 1000) < target_ms:
+        time.sleep(0.0005)
+
+def log_attempts(attempts):
+    print("\n📊 Tabela prób:\n")
+    hdr = f"{'Nr':<3} | {'Wysłano':<23} | {'Odebrano':<23} | {'Lat(ms)':<8} | {'Status':<7} | {'Qty':<8} | {'Cena':<10} | Msg"
+    print(hdr)
+    print("-" * len(hdr))
+    for i, a in enumerate(attempts, 1):
+        print(f"{i:<3} | {a['sent']:<23} | {a['recv']:<23} | {a['lat']:>7.2f} | {a['status']:<7} | "
+              f"{a['exec_qty']:<8.6f} | {a['price']:<10} | {a['msg']}")
+
+async def get_server_offset(client):
+    r = await client.get(f"{REST_URL}/api/v3/time")
+    return r.json()["serverTime"] - int(time.time() * 1000)
+
+async def warmup(client):
+    ts = int(time.time() * 1000) - 100_000
+    dummy = {
+        "symbol": SYMBOL, "side": "BUY", "type": "MARKET",
+        "quoteOrderQty": "0.000001", "recvWindow": "2000",
+        "timestamp": str(ts)
     }
-}
+    dummy["signature"] = sign(dummy, API_SECRET)
+    await client.post(f"{REST_URL}/api/v3/order", params=dummy, headers={"X-MEXC-APIKEY": API_KEY})
 
-// sign tworzy HMAC SHA256 nad querystringiem posortowanych parametrów
-func sign(params map[string]string, secret string) string {
-    keys := make([]string, 0, len(params))
-    for k := range params {
-        keys = append(keys, k)
+async def prepare_buy(client):
+    r = await client.get(f"{REST_URL}/api/v3/depth", params={"symbol": SYMBOL, "limit": 5})
+    asks = r.json().get("asks", [])
+    if not asks:
+        return None
+    market_price = float(asks[0][0])
+    limit_price = round(market_price * (1 + PRICE_MARKUP_PCT / 100), 8)
+    print(f"[PREP] market={market_price} → limit={limit_price}")
+    return limit_price
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Place BUY via HTTP REST (LIMIT or MARKET)
+# ──────────────────────────────────────────────────────────────────────────────
+async def place_buy(client, offset, send_at, qty, limit_price, success_evt):
+    busy_wait_until(send_at)
+    if success_evt.is_set():
+        return None
+
+    # build params
+    params = {
+        "symbol": SYMBOL,
+        "side": "BUY",
+        "type": "LIMIT" if limit_price else "MARKET",
+        "recvWindow": "5000",
+        "timestamp": str(int(time.time() * 1000) + offset)
     }
-    sort.Strings(keys)
-    var buf bytes.Buffer
-    for i, k := range keys {
-        if i > 0 {
-            buf.WriteString("&")
-        }
-        buf.WriteString(fmt.Sprintf("%s=%s", k, params[k]))
-    }
-    mac := hmac.New(sha256.New, []byte(secret))
-    mac.Write(buf.Bytes())
-    return fmt.Sprintf("%x", mac.Sum(nil))
-}
-
-func httpGet(client *http.Client, url string, headers, qs map[string]string) []byte {
-    req, _ := http.NewRequest("GET", url, nil)
-    q := req.URL.Query()
-    for k, v := range qs {
-        q.Set(k, v)
-    }
-    req.URL.RawQuery = q.Encode()
-    for k, v := range headers {
-        req.Header.Set(k, v)
-    }
-    resp, err := client.Do(req)
-    must(err)
-    defer resp.Body.Close()
-    data, err := ioutil.ReadAll(resp.Body)
-    must(err)
-    return data
-}
-
-func httpPost(client *http.Client, url string, headers, qs map[string]string) []byte {
-    req, _ := http.NewRequest("POST", url, nil)
-    q := req.URL.Query()
-    for k, v := range qs {
-        q.Set(k, v)
-    }
-    req.URL.RawQuery = q.Encode()
-    for k, v := range headers {
-        req.Header.Set(k, v)
-    }
-    resp, err := client.Do(req)
-    must(err)
-    defer resp.Body.Close()
-    body, err := ioutil.ReadAll(resp.Body)
-    must(err)
-    return body
-}
-
-func busyWait(targetMs int64) {
-    for time.Now().UnixNano()/1e6 < targetMs {
-    }
-}
-
-func logTable(attempts []map[string]interface{}) {
-    fmt.Println("\n📊 Wyniki prób:")
-    fmt.Printf("%-3s | %-12s | %-12s | %-7s | %-5s | %-8s | %s\n",
-        "Nr", "Sent", "Recv", "Lat(ms)", "Stat", "Qty", "Price/msg")
-    fmt.Println(strings.Repeat("-", 80))
-    for i, a := range attempts {
-        fmt.Printf("%-3d | %-12s | %-12s | %7.2f | %-5s | %8.6f | %v\n",
-            i+1,
-            a["sent"], a["recv"], a["lat"].(float64),
-            a["status"], a["exec_qty"].(float64), a["info"],
-        )
-    }
-}
-
-func main() {
-    // 1) Load listing
-    data, err := ioutil.ReadFile("current_listing.json")
-    must(err)
-    var l Listing
-    must(json.Unmarshal(data, &l))
-    log.Printf("[INFO] %s @ %s, amount=%.4f, markup=%.2f%%, profit=%.2f%%",
-        l.Symbol, l.ListingTime, l.QuoteAmount, l.PriceMarkupPct, l.ProfitPct)
-
-    client := &http.Client{}
-
-    // 2) Compute T0 (epoch-ms)
-    t0, err := time.Parse(time.RFC3339, l.ListingTime)
-    must(err)
-    t0ms := t0.UTC().UnixNano() / 1e6
-
-    // 3) –5s: sync + warmup
-    warmupTime := time.Now().UnixNano()/1e6 - 100_000
-    serverTimeData := httpGet(client, REST_URL+"/api/v3/time", nil, nil)
-    var srv struct{ ServerTime int64 `json:"serverTime"` }
-    must(json.Unmarshal(serverTimeData, &srv))
-    offset := srv.ServerTime - time.Now().UnixNano()/1e6
-    log.Printf("[SYNC] offset=%dms  → warmup", offset)
-    warmupParams := map[string]string{
-        "symbol":        l.Symbol,
-        "side":          "BUY",
-        "type":          "MARKET",
-        "quoteOrderQty": "0.000001",
-        "recvWindow":    "2000",
-        "timestamp":     strconv.FormatInt(warmupTime+offset, 10),
-    }
-    warmupParams["signature"] = sign(warmupParams, l.APISecret)
-    httpPost(client, REST_URL+"/api/v3/order", map[string]string{"X-MEXC-APIKEY": l.APIKey}, warmupParams)
-
-    // 4) –4s: pobierz orderbook
-    busyWait(t0ms - 4000 - offset)
-    depthData := httpGet(client, REST_URL+"/api/v3/depth", nil, map[string]string{"symbol": l.Symbol, "limit": "5"})
-    var depth struct{ Asks [][]string `json:"asks"` }
-    must(json.Unmarshal(depthData, &depth))
-
-    // oblicz ceny
-    var mode string
-    var limitPrice float64
-    if len(depth.Asks) == 0 {
-        log.Println("[BOT] orderbook pusty → MARKET mode")
-        mode = "MARKET"
-    } else {
-        price, _ := strconv.ParseFloat(depth.Asks[0][0], 64)
-        limitPrice = math.Round(price*(1+l.PriceMarkupPct/100)*1e8) / 1e8
-        log.Printf("[PREP] limitPrice=%.8f", limitPrice)
-        mode = "LIMIT"
-    }
-
-    qty := 0.0
-    if mode == "LIMIT" {
-        qty = math.Round(l.QuoteAmount/limitPrice*1e6) / 1e6
-    }
-
-    // 5) Trzy próby: –10ms, –5ms, 0ms
-    offsets := []int64{-10, -5, 0}
-    var success atomic.Bool
-    attempts := make([]map[string]interface{}, 0, 3)
-
-    for _, off := range offsets {
-        if success.Load() {
-            break
-        }
-        target := t0ms + off
-        busyWait(target - offset)
-
-        // zbuduj params
-        params := map[string]string{"symbol": l.Symbol, "side": "BUY", "recvWindow": "5000", "timestamp": strconv.FormatInt(time.Now().UnixNano()/1e6+offset, 10)}
-        if mode == "MARKET" {
-            params["type"] = "MARKET"
-            params["quoteOrderQty"] = fmt.Sprintf("%.6f", l.QuoteAmount)
-        } else {
-            params["type"] = "LIMIT"
-            params["price"] = fmt.Sprintf("%.8f", limitPrice)
-            params["quantity"] = fmt.Sprintf("%.6f", qty)
-            params["timeInForce"] = "IOC"
-        }
-        params["signature"] = sign(params, l.APISecret)
-
-        sent := time.Now().Format("15:04:05.000")
-        start := time.Now()
-        body := httpPost(client, REST_URL+"/api/v3/order", map[string]string{"X-MEXC-APIKEY": l.APIKey}, params)
-        lat := float64(time.Since(start).Microseconds()) / 1000.0
-        nowTs := time.Now().Format("15:04:05.000")
-
-        // analiza odpowiedzi
-        var resp map[string]interface{}
-        _ = json.Unmarshal(body, &resp)
-        execQty := 0.0
-        if v, ok := resp["executedQty"].(float64); ok {
-            execQty = v
-        }
-        status := "NOFILL"
-        if resp["orderId"] != nil && execQty > 0 {
-            status = "OK"
-            success.Store(true)
-        }
-        info := resp["price"]
-        if info == nil {
-            info = resp["msg"]
-        }
-
-        attempts = append(attempts, map[string]interface{}{
-            "sent":     sent,
-            "recv":     nowTs,
-            "lat":      lat,
-            "status":   status,
-            "exec_qty": execQty,
-            "info":     info,
+    if limit_price:
+        params.update({
+            "price": str(limit_price),
+            "quantity": str(round(qty, 6)),
+            "timeInForce": "IOC"
         })
+    else:
+        params["quoteOrderQty"] = str(QUOTE_AMOUNT)
+
+    params["signature"] = sign(params, API_SECRET)
+
+    sent = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    start = time.perf_counter()
+    resp = await client.post(f"{REST_URL}/api/v3/order", params=params, headers={"X-MEXC-APIKEY": API_KEY})
+    lat = (time.perf_counter() - start) * 1000
+    data = resp.json()
+    status = "OK" if data.get("executedQty", 0) > 0 else "NOFILL"
+    exec_qty = float(data.get("executedQty", 0))
+    price = data.get("price", params.get("price", ""))
+    msg = data.get("msg", "")
+
+    if status == "OK":
+        success_evt.set()
+
+    return {
+        "sent":    sent,
+        "recv":    datetime.now().strftime("%H:%M:%S.%f")[:-3],
+        "lat":     lat,
+        "status":  status,
+        "exec_qty": exec_qty,
+        "price":   price,
+        "msg":      msg
     }
 
-    // 6) Logowanie prób
-    logTable(attempts)
+# ──────────────────────────────────────────────────────────────────────────────
+#  Main flow
+# ──────────────────────────────────────────────────────────────────────────────
+async def main():
+    print(f"[INFO] {SYMBOL} @ {LISTING_TIME}, amount={QUOTE_AMOUNT}, markup={PRICE_MARKUP_PCT}%, profit={PROFIT_PCT}%")
 
-    if success.Load() {
-        // 7) SELL TP
-        sellPrice := math.Round(limitPrice*(1+l.ProfitPct/100)*1e8) / 1e8
-        sellQty := math.Round(qty*1e6) / 1e6
-        params := map[string]string{
-            "symbol":      l.Symbol,
-            "side":        "SELL",
-            "type":        "LIMIT",
-            "price":       fmt.Sprintf("%.8f", sellPrice),
-            "quantity":    fmt.Sprintf("%.6f", sellQty),
-            "timeInForce": "GTC",
-            "recvWindow":  "5000",
-            "timestamp":   strconv.FormatInt(time.Now().UnixNano()/1e6+offset, 10),
-        }
-        params["signature"] = sign(params, l.APISecret)
-        start := time.Now()
-        httpPost(client, REST_URL+"/api/v3/order", map[string]string{"X-MEXC-APIKEY": l.APIKey}, params)
-        log.Printf("[SELL] qty=%.6f price=%.8f lat=%.2fms",
-            sellQty, sellPrice, float64(time.Since(start).Microseconds())/1000.0)
-        return
-    }
+    # target T0 in epoch-ms
+    t0_ms = int(datetime.fromisoformat(LISTING_TIME)
+                .astimezone(timezone.utc).timestamp() * 1000)
 
-    // 8) Jeśli LIMIT i NOFILL w 3 próbach → stagnacja?
-    if mode == "LIMIT" {
-        log.Println("[BOT] wszystkie LIMIT próby NOFILL → sprawdzam stagnację przez 3s")
-        ask0 := ""
-        stagnant := true
-        for i := 0; i < 6; i++ { // co 500ms przez 3s
-            time.Sleep(500 * time.Millisecond)
-            d := httpGet(client, REST_URL+"/api/v3/depth", nil, map[string]string{"symbol": l.Symbol, "limit": "5"})
-            var dep struct{ Asks [][]string `json:"asks"` }
-            must(json.Unmarshal(d, &dep))
-            if len(dep.Asks) > 0 {
-                if ask0 == "" {
-                    ask0 = dep.Asks[0][0]
-                } else if dep.Asks[0][0] != ask0 {
-                    stagnant = false
-                    break
-                }
-            }
+    async with httpx.AsyncClient(http2=True) as client:
+        # 1) wait until ~5s before
+        target_warm = t0_ms - 5000
+        while int(time.time()*1000) < target_warm:
+            await asyncio.sleep(0.001)
+
+        # sync + warmup
+        offset = await get_server_offset(client)
+        print(f"[SYNC] offset: {offset} ms → warmup")
+        await warmup(client)
+
+        # prepare price ~4s before
+        limit_price = await prepare_buy(client)
+        qty = round(QUOTE_AMOUNT / limit_price, 6) if limit_price else None
+
+        # 2) schedule 3 concurrent BUYs at T0–10ms, –5ms, 0ms
+        buy_times = [t0_ms - 10, t0_ms - 5, t0_ms]
+        success = asyncio.Event()
+        tasks = [
+            place_buy(client, offset, buy_times[i], qty, limit_price, success)
+            for i in range(3)
+        ]
+
+        # 3) await & log
+        results = [r for r in await asyncio.gather(*tasks) if r]
+        log_attempts(results)
+
+        # 4) jeśli nic nie kupiono → no buy
+        filled = next((r["exec_qty"] * (limit_price or 1) for r in results if r["status"]=="OK"), 0)
+        if filled <= 0:
+            print("[BOT] no buy")
+            # tutaj można dodać pętlę stagnacji...
+            return
+
+        # 5) SELL LIMIT @ PROFIT
+        sell_price = round((limit_price or filled/filled) * (1 + PROFIT_PCT/100), 8)
+        sell_qty   = round(filled / (limit_price or sell_price), 6)
+        print(f"[BOT] SELL {sell_qty}@{sell_price}")
+
+        ts = str(int(time.time()*1000) + offset)
+        sell_params = {
+            "symbol": SYMBOL, "side": "SELL", "type": "LIMIT",
+            "price": str(sell_price), "quantity": str(sell_qty),
+            "timeInForce": "GTC", "recvWindow": "5000", "timestamp": ts
         }
-        if stagnant {
-            log.Println("[BOT] STAGNACJA wykryta → zaplanuj ponowny BUY za 10min od T0")
-        } else {
-            log.Println("[BOT] cena ruszyła → kończę z no buy")
-        }
-    } else {
-        log.Println("[BOT] no buy (MARKET fallback też się nie udał)")
-    }
-}
+        sell_params["signature"] = sign(sell_params, API_SECRET)
+
+        sent = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        start = time.perf_counter()
+        resp = await client.post(f"{REST_URL}/api/v3/order", params=sell_params,
+                                 headers={"X-MEXC-APIKEY": API_KEY})
+        lat = (time.perf_counter() - start) * 1000
+        d = resp.json()
+        status = "OK" if "orderId" in d else "ERR"
+        msg = d.get("msg", "")
+        print(f"[SELL] status={status} qty={sell_qty} price={sell_price} lat={lat:.2f}ms msg={msg}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
