@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -173,84 +174,68 @@ func main() {
 	buyOffsets := []int64{-10, -5, 0}
 	var success atomic.Bool
 	var results []attemptResult
+	var resultsMu sync.Mutex
 
-	// 5) Wyślij trzy próby równolegle, ale bez blokowania kolejki
-	type job struct{ off int64; idx int }
-	jobs := make(chan job, len(buyOffsets))
+	const preciseDelayMs = 0 // ustaw np. -2 jeśli trafiasz za późno
+
+	done := make(chan struct{}, len(buyOffsets))
 	for i, off := range buyOffsets {
-		jobs <- job{off, i}
-	}
-	close(jobs)
-
-	const preciseDelayMs = 0 // ustaw np. -1 lub -2 jeśli trafiasz za późno
-
-	// start workerów
-	done := make(chan struct{})
-	for w := 0; w < len(buyOffsets); w++ {
-		go func() {
-			for jb := range jobs {
-				if success.Load() {
-					break
-				}
-				target := t0ms + jb.off + preciseDelayMs
-
-				// Przygotuj parametry poza busy-wait
-				params := map[string]string{
-					"symbol":     l.Symbol,
-					"side":       "BUY",
-					"recvWindow": "5000",
-				}
-				if mode == "MARKET" {
-					params["type"] = "MARKET"
-					params["quoteOrderQty"] = fmt.Sprintf("%.6f", l.QuoteAmount)
-				} else {
-					params["type"] = "LIMIT"
-					params["price"] = fmt.Sprintf("%.8f", limitPrice)
-					params["quantity"] = fmt.Sprintf("%.6f", qty)
-					params["timeInForce"] = "IOC"
-				}
-
-				// Busy-wait do momentu target
-				busyWait(target - offset)
-
-				// Timestamp i signature generujesz dokładnie w tej ms
-				params["timestamp"] = strconv.FormatInt(time.Now().UnixNano()/1e6+offset, 10)
-				params["signature"] = sign(params, l.APISecret)
-
-				sent := time.Now()
-				body := httpPost(client, REST_URL+"/api/v3/order",
-					map[string]string{"X-MEXC-APIKEY": l.APIKey}, params)
-				recv := time.Now()
-				lat := float64(recv.Sub(sent).Microseconds()) / 1000.0
-
-				var resp map[string]interface{}
-				json.Unmarshal(body, &resp)
-
-				stat := "NOFILL"
-				execQty := 0.0
-				if v, ok := resp["executedQty"].(float64); ok && v > 0 {
-					execQty = v
-					stat = "OK"
-					success.Store(true)
-				}
-				msg := fmt.Sprint(resp["msg"])
-
-				results = append(results, attemptResult{
-					Sent:    sent.Format("15:04:05.000"),
-					Recv:    recv.Format("15:04:05.000"),
-					Latency: lat,
-					Status:  stat,
-					Qty:     execQty,
-					Price:   limitPrice,
-					Msg:     msg,
-				})
-
-				log.Printf("[TRY] sent=%s recv=%s lat=%.2fms stat=%s qty=%.6f msg=%s",
-					sent.Format("15:04:05.000"), recv.Format("15:04:05.000"),
-					lat, stat, execQty, msg)
+		go func(idx int, offsetMs int64) {
+			// Przygotuj parametry poza busy-wait
+			params := map[string]string{
+				"symbol":     l.Symbol,
+				"side":       "BUY",
+				"recvWindow": "5000",
 			}
+			if mode == "MARKET" {
+				params["type"] = "MARKET"
+				params["quoteOrderQty"] = fmt.Sprintf("%.6f", l.QuoteAmount)
+			} else {
+				params["type"] = "LIMIT"
+				params["price"] = fmt.Sprintf("%.8f", limitPrice)
+				params["quantity"] = fmt.Sprintf("%.6f", qty)
+				params["timeInForce"] = "IOC"
+			}
+			target := t0ms + offsetMs + preciseDelayMs
+			busyWait(target - offset)
+			params["timestamp"] = strconv.FormatInt(time.Now().UnixNano()/1e6+offset, 10)
+			params["signature"] = sign(params, l.APISecret)
+
+			sent := time.Now()
+			body := httpPost(client, REST_URL+"/api/v3/order",
+				map[string]string{"X-MEXC-APIKEY": l.APIKey}, params)
+			recv := time.Now()
+			lat := float64(recv.Sub(sent).Microseconds()) / 1000.0
+
+			var resp map[string]interface{}
+			json.Unmarshal(body, &resp)
+
+			stat := "NOFILL"
+			execQty := 0.0
+			if v, ok := resp["executedQty"].(float64); ok && v > 0 {
+				execQty = v
+				stat = "OK"
+				success.Store(true)
+			}
+			msg := fmt.Sprint(resp["msg"])
+
+			resultsMu.Lock()
+			results = append(results, attemptResult{
+				Sent:    sent.Format("15:04:05.000"),
+				Recv:    recv.Format("15:04:05.000"),
+				Latency: lat,
+				Status:  stat,
+				Qty:     execQty,
+				Price:   limitPrice,
+				Msg:     msg,
+			})
+			resultsMu.Unlock()
+
+			log.Printf("[TRY] sent=%s recv=%s lat=%.2fms stat=%s qty=%.6f msg=%s",
+				sent.Format("15:04:05.000"), recv.Format("15:04:05.000"),
+				lat, stat, execQty, msg)
 			done <- struct{}{}
-		}()
+		}(i, off)
 	}
 
 	// czekaj aż wszyscy pracownicy skończą
