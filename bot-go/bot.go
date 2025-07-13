@@ -105,6 +105,10 @@ func httpPost(client *http.Client, url string, headers, qs map[string]string) []
 
 // busy-wait until epoch-ms reaches target
 func busyWait(targetMs int64) {
+	sleepMs := targetMs - time.Now().UnixNano()/1e6 - 2
+	if sleepMs > 0 {
+		time.Sleep(time.Duration(sleepMs) * time.Millisecond)
+	}
 	for time.Now().UnixNano()/1e6 < targetMs {
 	}
 }
@@ -123,14 +127,31 @@ func main() {
 	must(err)
 	t0ms := t0.UTC().UnixNano() / 1e6
 
-	// 2) Na ~5s przed T0: synchronizacja czasu + warmup
-	sharedClient := &http.Client{}
+	// 2) Stwórz wspólny transport i trzech klientów (dedykowane połączenia)
+	tr := &http.Transport{
+		MaxIdleConns:        10,
+		MaxIdleConnsPerHost: 10,
+		IdleConnTimeout:     90 * time.Second,
+		DisableKeepAlives:   false,
+	}
+	clients := []*http.Client{
+		{Transport: tr},
+		{Transport: tr},
+		{Transport: tr},
+	}
+	sharedClient := &http.Client{Transport: tr}
+
+	// 3) Synchronizacja czasu + warmup połączeń (rozgrzej 3 keep-alive TCP/TLS!)
 	offsetData := httpGet(sharedClient, REST_URL+"/api/v3/time", nil, nil)
 	var srv struct{ ServerTime int64 `json:"serverTime"` }
 	must(json.Unmarshal(offsetData, &srv))
 	offset := srv.ServerTime - time.Now().UnixNano()/1e6
 	log.Printf("[SYNC] offset=%dms", offset)
 
+	// rozgrzewka 3 połączeń (GET), każde osobnym klientem!
+	for i := 0; i < 3; i++ {
+		httpGet(clients[i], REST_URL+"/api/v3/time", nil, nil)
+	}
 	warmupTs := strconv.FormatInt(time.Now().UnixNano()/1e6+offset-100000, 10)
 	warmupParams := map[string]string{
 		"symbol":        l.Symbol,
@@ -142,12 +163,12 @@ func main() {
 	}
 	warmupParams["signature"] = sign(warmupParams, l.APISecret)
 	httpPost(sharedClient, REST_URL+"/api/v3/order", map[string]string{"X-MEXC-APIKEY": l.APIKey}, warmupParams)
-	log.Println("[WARMUP] done")
+	log.Println("[WARMUP] done (keep-alive x3)")
 
 	// czekaj aż do ~4s przed
 	busyWait(t0ms - 4000 - offset)
 
-	// 3) Pobierz ASK z orderbook, oblicz limit-price lub tryb MARKET
+	// 4) Pobierz ASK z orderbook, oblicz limit-price lub tryb MARKET
 	depthData := httpGet(sharedClient, REST_URL+"/api/v3/depth", nil,
 		map[string]string{"symbol": l.Symbol, "limit": "5"})
 	var depth struct{ Asks [][]string `json:"asks"` }
@@ -169,7 +190,7 @@ func main() {
 		qty = math.Round(l.QuoteAmount/limitPrice*1e6) / 1e6
 	}
 
-	// 4) Przygotuj próby: T0-10ms, -5ms, 0ms
+	// 5) Przygotuj próby: T0-10ms, -5ms, 0ms
 	buyOffsets := []int64{-10, -5, 0}
 	var success atomic.Bool
 	var results []attemptResult
@@ -179,10 +200,8 @@ func main() {
 
 	done := make(chan struct{}, len(buyOffsets))
 	for i, off := range buyOffsets {
-		go func(idx int, offsetMs int64) {
-			// KAŻDA próba: własny http.Client!
-			myClient := &http.Client{}
-
+		myClient := clients[i]
+		go func(idx int, offsetMs int64, cli *http.Client) {
 			params := map[string]string{
 				"symbol":     l.Symbol,
 				"side":       "BUY",
@@ -203,7 +222,7 @@ func main() {
 			params["signature"] = sign(params, l.APISecret)
 
 			sent := time.Now()
-			body := httpPost(myClient, REST_URL+"/api/v3/order",
+			body := httpPost(cli, REST_URL+"/api/v3/order",
 				map[string]string{"X-MEXC-APIKEY": l.APIKey}, params)
 			recv := time.Now()
 			lat := float64(recv.Sub(sent).Microseconds()) / 1000.0
@@ -236,7 +255,7 @@ func main() {
 				sent.Format("15:04:05.000"), recv.Format("15:04:05.000"),
 				lat, stat, execQty, msg)
 			done <- struct{}{}
-		}(i, off)
+		}(i, off, myClient)
 	}
 
 	// czekaj aż wszyscy pracownicy skończą
