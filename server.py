@@ -86,7 +86,8 @@ def run_bot(listing_id: str):
     entry = next(x for x in all_listings if x["id"] == listing_id)
     CURRENT_FILE.write_text(json.dumps(entry, indent=2))
     # Uruchamiamy binarkę Go z argumentem ID
-    subprocess.Popen([str(BOT_BINARY), listing_id], cwd=str(BASE_DIR))
+    # subprocess.Popen([str(BOT_BINARY), listing_id], cwd=str(BASE_DIR))
+    subprocess.Popen(["php", "mexc_sniper.php"], cwd=str(BASE_DIR))
     print(f"[SCHED] Launched sniper-bot for listing {listing_id}")
 
 
