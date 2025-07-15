@@ -1,136 +1,132 @@
 <?php
-// mexc_sniper.php — ultraszybki PHP bot na MEXC (market buy + take profit)
+// mexc_sniper.php — superszybki bot PHP do market buy na MEXC, bierze dane z current_listing.json
 
-$listing = json_decode(file_get_contents(__DIR__ . '/current_listing.json'), true);
-if (!$listing) die("❌ Nie mogę odczytać current_listing.json\n");
-
+// === 1. Wczytaj dane z current_listing.json ===
+$listing_file = __DIR__ . '/current_listing.json';
+if (!file_exists($listing_file)) {
+    fwrite(STDERR, "Brak pliku current_listing.json\n");
+    exit(1);
+}
+$listing = json_decode(file_get_contents($listing_file), true);
 $api_key     = $listing['api_key'];
 $api_secret  = $listing['api_secret'];
 $symbol      = strtoupper($listing['symbol']);
-$quote_amount= floatval($listing['quote_amount']);
+$quote_amt   = floatval($listing['quote_amount']);
 $profit_pct  = floatval($listing['profit_pct'] ?? 15);
 
-// HMAC SHA256
+// === 2. Funkcja podpisująca ===
 function sign($params, $secret) {
     ksort($params);
     $query = http_build_query($params, '', '&', PHP_QUERY_RFC3986);
     return hash_hmac('sha256', $query, $secret);
 }
 
-// --- CURL Init, re-use handle!
-$ch = curl_init();
-curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-curl_setopt($ch, CURLOPT_HTTPHEADER, [
-    'Connection: keep-alive',
-    'Content-Type: application/json',
-]);
-
-// MARKET BUY
-function market_buy($ch, $symbol, $quote_amount, $api_key, $api_secret) {
-    $url = 'https://api.mexc.com/api/v3/order';
-    $params = [
-        'symbol'        => $symbol,
-        'side'          => 'BUY',
-        'type'          => 'MARKET',
-        'quoteOrderQty' => $quote_amount,
-        'timestamp'     => round(microtime(true)*1000),
-        'recvWindow'    => 5000
-    ];
-    $params['signature'] = sign($params, $api_secret);
-
-    $headers = [
-        'X-MEXC-APIKEY: ' . $api_key,
-        'Connection: keep-alive',
-        'Content-Type: application/json',
-        'Expect:',
-    ];
-
-    curl_setopt($ch, CURLOPT_URL, $url . '?' . http_build_query($params));
-    curl_setopt($ch, CURLOPT_POST, true);
-    curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
-    curl_setopt($ch, CURLOPT_POSTFIELDS, '');
-    $send = microtime(true);
-    $resp = curl_exec($ch);
-    $recv = microtime(true);
-    $httpcode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    if ($httpcode != 200) die("❌ MARKET BUY fail $resp\n");
-    $data = json_decode($resp, true);
-    $latency = round(($recv - $send) * 1000);
-    printf("🎉 MARKET BUY ok: orderId=%s\n%-24s | %-24s | %9d | %s\n",
-        $data['orderId'],
-        date('H:i:s.u', (int)$send) . sprintf("%03d", ($send*1000)%1000),
-        date('H:i:s.u', (int)$recv) . sprintf("%03d", ($recv*1000)%1000),
-        $latency,
-        'MARKET BUY'
-    );
-    return [$data['orderId'], $latency];
+// === 3. Pobierz czas serwera z MEXC ===
+function get_server_time() {
+    $data = json_decode(file_get_contents('https://api.mexc.com/api/v3/time'), true);
+    return $data['serverTime'];
 }
 
-// LIMIT SELL (TP)
-function limit_sell($ch, $symbol, $qty, $price, $api_key, $api_secret) {
-    $url = 'https://api.mexc.com/api/v3/order';
-    $params = [
-        'symbol'    => $symbol,
-        'side'      => 'SELL',
-        'type'      => 'LIMIT',
-        'timeInForce'=> 'GTC',
-        'quantity'  => sprintf('%.8f', $qty),
-        'price'     => sprintf('%.8f', $price),
-        'timestamp' => round(microtime(true)*1000),
-        'recvWindow'=> 5000
-    ];
-    $params['signature'] = sign($params, $api_secret);
-
-    $headers = [
-        'X-MEXC-APIKEY: ' . $api_key,
-        'Connection: keep-alive',
-        'Content-Type: application/json',
-        'Expect:',
-    ];
-
-    curl_setopt($ch, CURLOPT_URL, $url . '?' . http_build_query($params));
-    curl_setopt($ch, CURLOPT_POST, true);
-    curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
-    curl_setopt($ch, CURLOPT_POSTFIELDS, '');
-    $send = microtime(true);
-    $resp = curl_exec($ch);
-    $recv = microtime(true);
-    $httpcode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    if ($httpcode != 200) die("❌ LIMIT SELL fail $resp\n");
-    $data = json_decode($resp, true);
-    $latency = round(($recv - $send) * 1000);
-    printf("🎯 TP SELL: orderId=%s\n%-24s | %-24s | %9d | %s\n",
-        $data['orderId'],
-        date('H:i:s.u', (int)$send) . sprintf("%03d", ($send*1000)%1000),
-        date('H:i:s.u', (int)$recv) . sprintf("%03d", ($recv*1000)%1000),
-        $latency,
-        'LIMIT SELL'
-    );
-    return $latency;
+// === 4. Market Buy + TP z tabelą opóźnień ===
+function ms_time_format($ms) {
+    $dt = new DateTime("@".intval($ms/1000));
+    $dt->setTimezone(new DateTimeZone(date_default_timezone_get()));
+    $milli = str_pad($ms % 1000, 3, '0', STR_PAD_LEFT);
+    return $dt->format("H:i:s") . ".$milli";
 }
 
-// -- GŁÓWNA LOGIKA
 echo "📊 Performance:\n";
-echo "Sent                    | Received                | Latency   | Type  \n";
+echo str_pad("Sent", 24) . " | " . str_pad("Received", 24) . " | " . str_pad("Latency", 8) . " | Type\n";
 
-list($orderId, $lat1) = market_buy($ch, $symbol, $quote_amount, $api_key, $api_secret);
-// Tu możesz dodać fetch_order jeśli chcesz (opcjonalnie: sleep(0.5);)
+// ——— MARKET BUY ———
+$server_time = get_server_time();
+$params = [
+    'symbol'        => $symbol,
+    'side'          => 'BUY',
+    'type'          => 'MARKET',
+    'quoteOrderQty' => $quote_amt,
+    'timestamp'     => $server_time,
+    'recvWindow'    => 5000
+];
+$params['signature'] = sign($params, $api_secret);
+$url = 'https://api.mexc.com/api/v3/order?' . http_build_query($params, '', '&', PHP_QUERY_RFC3986);
 
-$exec_price = $listing['price'] ?? 0; // Jeśli masz order fetch — pobierz real price!
-if (!$exec_price) $exec_price = $listing['limit_price'] ?? 0; // fallback jeśli brak
-
-if (!$exec_price) {
-    // Możesz dodać fetch_order() w razie potrzeby, a tu sleep(1)
-    sleep(1);
-    // ... pobierz order fetch tu i nadpisz $exec_price
-}
-
-$tp_price = $exec_price ? $exec_price * (1.0 + $profit_pct/100.0) : 0;
-$qty = $listing['qty'] ?? 0; // lub pobierz z fetch_order
-if ($tp_price && $qty) {
-    $lat2 = limit_sell($ch, $symbol, $qty, $tp_price, $api_key, $api_secret);
-}
-
+$headers = [
+    'X-MEXC-APIKEY: ' . $api_key,
+    'Content-Type: application/json'
+];
+$sent = microtime(true);
+$ch = curl_init();
+curl_setopt($ch, CURLOPT_URL, $url);
+curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+curl_setopt($ch, CURLOPT_POST, true);
+curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+curl_setopt($ch, CURLOPT_POSTFIELDS, '');
+$resp = curl_exec($ch);
+$received = microtime(true);
 curl_close($ch);
+
+$latency = intval(($received - $sent) * 1000);
+$data = json_decode($resp, true);
+if (isset($data['orderId'])) {
+    echo "🎉 MARKET BUY ok: orderId={$data['orderId']}\n";
+    echo ms_time_format(intval($sent*1000)) . " | " . ms_time_format(intval($received*1000)) . " | ";
+    echo str_pad($latency, 8) . " | MARKET BUY\n";
+    $orderId = $data['orderId'];
+} else {
+    echo "❌ MARKET BUY fail $resp\n";
+    exit(1);
+}
+
+// ——— TP SELL ———
+sleep(1);
+$params = [
+    'symbol'    => $symbol,
+    'orderId'   => $orderId,
+    'timestamp' => get_server_time(),
+    'recvWindow'=> 5000
+];
+$params['signature'] = sign($params, $api_secret);
+$url = 'https://api.mexc.com/api/v3/order?' . http_build_query($params, '', '&', PHP_QUERY_RFC3986);
+$resp = file_get_contents($url, false, stream_context_create(['http' => ['header' => "X-MEXC-APIKEY: $api_key\r\n"]]));
+$order_data = json_decode($resp, true);
+$qty   = floatval($order_data['executedQty']);
+$price = floatval($order_data['price']);
+$tp_price = round($price * (1.0 + $profit_pct/100.0), 8);
+
+$params = [
+    'symbol'    => $symbol,
+    'side'      => 'SELL',
+    'type'      => 'LIMIT',
+    'timeInForce'=> 'GTC',
+    'quantity'  => sprintf('%.8f', $qty),
+    'price'     => sprintf('%.8f', $tp_price),
+    'timestamp' => get_server_time(),
+    'recvWindow'=> 5000
+];
+$params['signature'] = sign($params, $api_secret);
+$url = 'https://api.mexc.com/api/v3/order?' . http_build_query($params, '', '&', PHP_QUERY_RFC3986);
+
+$sent2 = microtime(true);
+$ch = curl_init();
+curl_setopt($ch, CURLOPT_URL, $url);
+curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+curl_setopt($ch, CURLOPT_POST, true);
+curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+curl_setopt($ch, CURLOPT_POSTFIELDS, '');
+$resp2 = curl_exec($ch);
+$received2 = microtime(true);
+curl_close($ch);
+
+$latency2 = intval(($received2 - $sent2) * 1000);
+$data2 = json_decode($resp2, true);
+if (isset($data2['orderId'])) {
+    echo "🎯 TP SELL: orderId={$data2['orderId']}\n";
+    echo ms_time_format(intval($sent2*1000)) . " | " . ms_time_format(intval($received2*1000)) . " | ";
+    echo str_pad($latency2, 8) . " | LIMIT SELL\n";
+} else {
+    echo "❌ TP SELL fail $resp2\n";
+    exit(1);
+}
 
 echo "✅ Zakończono\n";
