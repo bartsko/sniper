@@ -28,6 +28,7 @@ pip3 install -r requirements.txt
 chmod +x "$BOT_DIR/mexc_sniper.php"
 
 # —————————————————————————————————————————————
+# —————————————————————————————————————————————
 # 5) Tworzymy i włączamy usługę systemd dla FastAPI
 cat > /tmp/sniper-backend.service <<EOF
 [Unit]
@@ -52,6 +53,13 @@ chmod 644 "$SERVICE_PATH"
 systemctl daemon-reload
 systemctl enable sniper-backend.service
 systemctl restart sniper-backend.service
+
+# —————————————————————————————————————————————
+# 5.5) Otwieramy port 8000 w firewallu (UFW)
+if command -v ufw >/dev/null 2>&1; then
+  ufw allow 8000/tcp || true
+  ufw reload || true
+fi
 
 # —————————————————————————————————————————————
 # 6) Podsumowanie
