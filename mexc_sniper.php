@@ -1,8 +1,17 @@
 <?php
-// mexc_ultra.php — ultraszybki bot MEXC Market Buy + Latency log + TLS warmup
+// mexc_ultra.php — ultraszybki bot MEXC Market Buy + Latency log + TLS warmup + logfile
+
+$logfile = __DIR__ . '/mexc_bot.log';
+function logit($msg) {
+    global $logfile;
+    file_put_contents($logfile, "[" . date('Y-m-d H:i:s') . "] $msg\n", FILE_APPEND);
+}
 
 $listing = json_decode(file_get_contents(__DIR__ . '/current_listing.json'), true);
-if (!$listing) die("❌ Brak current_listing.json\n");
+if (!$listing) {
+    logit("❌ Brak current_listing.json");
+    die("❌ Brak current_listing.json\n");
+}
 
 $api_key     = $listing['api_key'];
 $api_secret  = $listing['api_secret'];
@@ -62,12 +71,25 @@ $latency = round((mtime() - $start) * 1000); // ms
 $httpcode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
 curl_close($ch);
 
+// Logujemy wszystko
+logit("MARKET BUY sent: " . json_encode($params));
+logit("HTTP $httpcode, latency: {$latency} ms, resp: $resp");
+
 echo "⏱ Latency: {$latency} ms\n";
 
-if ($httpcode != 200) die("❌ MARKET BUY fail $resp\n");
-$data = json_decode($resp, true);
-echo "🎉 MARKET BUY ok: orderId=" . $data['orderId'] . "\n";
+if ($httpcode != 200) {
+    logit("❌ MARKET BUY FAIL, HTTP $httpcode, RESP: $resp");
+    die("❌ MARKET BUY fail $resp\n");
+}
 
-// Dalej możesz dorzucić take profit — ale samo MARKET BUY wykaże najniższe latency!
+$data = json_decode($resp, true);
+if (isset($data['orderId'])) {
+    echo "🎉 MARKET BUY ok: orderId=" . $data['orderId'] . "\n";
+    logit("🎉 MARKET BUY ok: orderId=" . $data['orderId']);
+} else {
+    logit("❌ MARKET BUY error: " . $resp);
+    echo "❌ MARKET BUY error: $resp\n";
+}
 
 // Done!
+?>
